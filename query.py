@@ -1,4 +1,4 @@
-"""Query selection for the reconciliation state machine."""
+"""Expected-value query selection for reconciliation."""
 
 from __future__ import annotations
 
@@ -20,17 +20,12 @@ def choose_query(
     candidates: Mapping[str, Sequence[Mapping[str, Any]]],
     state: Mapping[str, Any],
 ) -> str | None:
-    """Choose one high-value payment/group query, or return ``None``.
-
-    The expected loss of accepting the current best link is approximated as
-    ``(1-p) * 5 * value``.  Querying is worthwhile when that avoidable loss
-    exceeds the fixed query cost.
-    """
+    """Return the highest-value unqueried payment, at most once per step."""
     used = {str(item) for item in state.get("queried", [])}
     if _number(state.get("queries_used")) >= MAX_QUERIES:
         return None
 
-    best: tuple[int, str] | None = None
+    best: tuple[float, str] | None = None
     for payment in payments:
         payment_id = str(
             payment.get("payment_id", payment.get("id", payment.get("transaction_id", "")))
@@ -41,38 +36,39 @@ def choose_query(
         if len(options) < 2:
             continue
         confidences = sorted(
-            (float(item.get("confidence", item.get("score", 0.0)) or 0.0)
+            (max(0.0, min(1.0, float(item.get("confidence", item.get("score", 0.0)) or 0.0)))
              for item in options),
             reverse=True,
         )
         top, second = confidences[:2]
-        hints_conflict = bool(
+        conflicting = bool(
             payment.get("conflicting_hints", payment.get("conflict", False))
         )
-        ambiguous = hints_conflict or (top - second <= 0.15)
-        if not ambiguous:
+        if not conflicting and top - second > 0.15:
             continue
         value = abs(
             _number(payment.get("amount", payment.get("gross", payment.get("value", 0))))
         )
-        expected_gain = value * max(0.0, 1.0 - top)
-        # A query prevents a wrong link (four extra units beyond suspense).
-        expected_gain *= 5
-        if expected_gain <= QUERY_COST:
+        if value <= QUERY_COST:
             continue
-        rank = int(expected_gain)
-        if best is None or rank > best[0]:
-            best = (rank, payment_id)
+        # Querying avoids the five-unit wrong-link loss; suspense is the
+        # one-unit alternative, so only the four-unit incremental loss is
+        # attributable to the query.
+        gain = value * max(0.0, 1.0 - top) * 4
+        if gain <= QUERY_COST:
+            continue
+        if best is None or gain > best[0]:
+            best = (gain, payment_id)
     return best[1] if best else None
 
 
 def record_query(state: Mapping[str, Any], payment_id: str) -> dict[str, Any]:
-    """Return a JSON-serializable state after issuing one query."""
+    """Return state after issuing one query, preserving JSON-compatible data."""
     result = dict(state)
     queried = list(result.get("queried", []))
-    if payment_id not in queried:
+    if payment_id not in queried and len(queried) < MAX_QUERIES:
         queried.append(payment_id)
+        result["queries_used"] = len(queried)
     result["queried"] = queried
-    result["queries_used"] = int(result.get("queries_used", 0)) + 1
     result["phase"] = "awaiting_query"
     return result
