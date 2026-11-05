@@ -1,3 +1,5 @@
+__pycache__/
+*.pyc
 SCHEMA.md
 OBSERVATIONS.md
 DEVELOPMENT.md
@@ -5,3 +7,4 @@ local_check.py
 training.json
 practice.json
 .venv/
+submission.zip
