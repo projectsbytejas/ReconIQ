@@ -1,45 +1,44 @@
 from dataclasses import dataclass, field
-from typing import Optional, List
-
+from typing import Optional
 
 @dataclass
 class Invoice:
     invoice_id: str
-    merchant: str
+    merchant_id: str
+    customer_id: str
+    amount: int
     currency: str
-    gross_amount: int
-
-    captured_amount: int = 0
-
-    status: str = "OPEN"
-
-    due_date: Optional[str] = None
-
+    issue_day: int
+    due_day: int
+    status: str
 
 @dataclass
 class Payment:
     payment_id: str
-
-    merchant: str
-
+    amount: int
+    merchant_id: str
     currency: str
+    capture_day: int
+    processor_reference: Optional[str]
+    sender_name: Optional[str]
+    transaction_id: str
 
-    gross_amount: int
+@dataclass
+class BankCredit:
+    bank_id: str
+    payment_id: str
+    amount: int
 
-    reference: Optional[str]
-
-    payer: Optional[str]
-
-    timestamp: Optional[str]
-
-    duplicate: bool = False
-
-    refunded: bool = False
-
+@dataclass
+class Refund:
+    refund_id: str
+    payment_id: str
+    amount: int
 
 @dataclass
 class Batch:
-
-    invoices: List[Invoice]
-
-    payments: List[Payment]
+    invoices: list[Invoice]
+    payments: list[Payment]
+    bank_credits: list[BankCredit]
+    refunds: list[Refund]
+    raw: dict
