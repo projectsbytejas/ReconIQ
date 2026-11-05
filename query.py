@@ -1,4 +1,4 @@
-"""Expected-value query selection for reconciliation."""
+"""Investigation selection for the v6 reconciliation contract."""
 
 from __future__ import annotations
 
@@ -6,69 +6,56 @@ from typing import Any, Mapping, Sequence
 
 QUERY_COST = 180
 MAX_QUERIES = 4
+MINIMUM_QUERY_VALUE = QUERY_COST
+QUERY_CLOSENESS = 0.15
 
 
-def _number(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def _amount(payment_id: str, totals: Mapping[str, int]) -> int:
+    return abs(int(totals.get(payment_id, 0)))
 
 
 def choose_query(
     payments: Sequence[Mapping[str, Any]],
     candidates: Mapping[str, Sequence[Mapping[str, Any]]],
+    values: Mapping[str, int],
     state: Mapping[str, Any],
+    *,
+    minimum_value: int = QUERY_COST,
+    closeness: float = 0.15,
 ) -> str | None:
-    """Return the highest-value unqueried payment, at most once per step."""
-    used = {str(item) for item in state.get("queried", [])}
-    if _number(state.get("queries_used")) >= MAX_QUERIES:
+    """Choose one unqueried high-value ambiguous payment."""
+    queried = {str(item) for item in state.get("queried", [])}
+    if int(state.get("queries_used", 0)) >= MAX_QUERIES:
         return None
-
     best: tuple[float, str] | None = None
     for payment in payments:
-        payment_id = str(
-            payment.get("payment_id", payment.get("id", payment.get("transaction_id", "")))
-        )
-        if not payment_id or payment_id in used:
+        pid = str(payment.get("payment_id", ""))
+        if not pid or pid in queried or _amount(pid, values) <= minimum_value:
             continue
-        options = list(candidates.get(payment_id, ()))
-        if len(options) < 2:
-            continue
-        confidences = sorted(
-            (max(0.0, min(1.0, float(item.get("confidence", item.get("score", 0.0)) or 0.0)))
-             for item in options),
+        options = sorted(
+            candidates.get(pid, ()),
+            key=lambda item: float(item.get("confidence", 0)),
             reverse=True,
         )
-        top, second = confidences[:2]
-        conflicting = bool(
-            payment.get("conflicting_hints", payment.get("conflict", False))
-        )
-        if not conflicting and top - second > 0.15:
+        if len(options) < 2:
             continue
-        value = abs(
-            _number(payment.get("amount", payment.get("gross", payment.get("value", 0))))
-        )
-        if value <= QUERY_COST:
+        top = max(0.0, min(1.0, float(options[0].get("confidence", 0))))
+        second = max(0.0, min(1.0, float(options[1].get("confidence", 0))))
+        if not payment.get("conflicting_hints", False) and top - second > closeness:
             continue
-        # Querying avoids the five-unit wrong-link loss; suspense is the
-        # one-unit alternative, so only the four-unit incremental loss is
-        # attributable to the query.
-        gain = value * max(0.0, 1.0 - top) * 4
-        if gain <= QUERY_COST:
-            continue
-        if best is None or gain > best[0]:
-            best = (gain, payment_id)
+        probability_wrong = 0.5 if top - second <= closeness else (1.0 - top)
+        gain = _amount(pid, values) * probability_wrong * 4
+        if gain > QUERY_COST and (best is None or gain > best[0]):
+            best = (gain, pid)
     return best[1] if best else None
 
 
 def record_query(state: Mapping[str, Any], payment_id: str) -> dict[str, Any]:
-    """Return state after issuing one query, preserving JSON-compatible data."""
     result = dict(state)
     queried = list(result.get("queried", []))
     if payment_id not in queried and len(queried) < MAX_QUERIES:
         queried.append(payment_id)
-        result["queries_used"] = len(queried)
     result["queried"] = queried
-    result["phase"] = "awaiting_query"
+    result["queries_used"] = len(queried)
+    result["phase"] = "query"
     return result
