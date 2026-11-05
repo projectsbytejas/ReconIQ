@@ -1,13 +1,29 @@
 """
 matcher.py - Matching Engine for EcoRecon
 
-Orchestrates candidate generation, confidence scoring, and optimal assignment 
+Orchestrates candidate generation, confidence scoring, and optimal assignment
 while rejecting low-confidence links to avoid costly false matches.
 """
 
 from typing import List, Dict, Any, Tuple, Hashable
-from scipy.optimize import linear_sum_assignment
-import numpy as np
+try:
+    from scipy.optimize import linear_sum_assignment
+    import numpy as np
+except ImportError:
+    np = None
+
+    def linear_sum_assignment(matrix):
+        rows = range(len(matrix))
+        cols = range(len(matrix[0])) if matrix else range(0)
+        used = set()
+        pairs = []
+        for row in rows:
+            choices = [(matrix[row][col], col) for col in cols if col not in used]
+            if choices:
+                _, col = min(choices)
+                used.add(col)
+                pairs.append((row, col))
+        return [pair[0] for pair in pairs], [pair[1] for pair in pairs]
 from scorer import score, HIGH_CONFIDENCE_THRESHOLD
 
 
@@ -70,7 +86,7 @@ def generate_candidates(
     """
     Generate plausible payment-invoice candidate pairs based on fast heuristic filters
     (e.g., currency matching, loose date proximity, and non-zero amount overlaps).
-    
+
     Do NOT parse files or handle queries here.
     """
     payment_map = _index_records(payments, "payment_id", "Payment")
@@ -85,7 +101,7 @@ def match(payments: List[Dict[str, Any]], invoices: List[Dict[str, Any]]) -> Dic
     2. Score candidate pairs.
     3. Perform optimal assignment (global optimization using scipy).
     4. Filter out low confidence matches (leaving unresolved is preferred over wrong matches).
-    
+
     Returns:
         Dict containing:
             - 'accepted_matches': List of high-confidence matches with scores.
@@ -95,10 +111,10 @@ def match(payments: List[Dict[str, Any]], invoices: List[Dict[str, Any]]) -> Dic
     # Map IDs to objects for fast lookup
     payment_map = _index_records(payments, "payment_id", "Payment")
     invoice_map = _index_records(invoices, "invoice_id", "Invoice")
-    
+
     p_ids = list(payment_map.keys())
     inv_ids = list(invoice_map.keys())
-    
+
     if not p_ids or not inv_ids:
         return {
             "accepted_matches": [],
@@ -107,9 +123,13 @@ def match(payments: List[Dict[str, Any]], invoices: List[Dict[str, Any]]) -> Dic
         }
 
     # Build cost/score matrix (rows: payments, cols: invoices)
-    score_matrix = np.zeros((len(p_ids), len(inv_ids)))
+    score_matrix = (
+        np.zeros((len(p_ids), len(inv_ids)))
+        if np is not None
+        else [[0.0 for _ in inv_ids] for _ in p_ids]
+    )
     candidate_pairs = set(_generate_candidates(payment_map, invoice_map))
-    
+
     for i, p_id in enumerate(p_ids):
         for j, inv_id in enumerate(inv_ids):
             if (p_id, inv_id) not in candidate_pairs:
@@ -121,19 +141,19 @@ def match(payments: List[Dict[str, Any]], invoices: List[Dict[str, Any]]) -> Dic
 
     # Convert scores to costs for linear_sum_assignment (Maximizing score == Minimizing negative score)
     cost_matrix = -score_matrix
-    
+
     # Solve optimal bipartite matching
     row_ind, col_ind = linear_sum_assignment(cost_matrix)
-    
+
     accepted_matches = []
     matched_payments = set()
     matched_invoices = set()
-    
+
     for r, c in zip(row_ind, col_ind):
         p_id = p_ids[r]
         inv_id = inv_ids[c]
         confidence = float(score_matrix[r, c])
-        
+
         # Enforce high confidence threshold (Never guess rule)
         if confidence >= HIGH_CONFIDENCE_THRESHOLD:
             accepted_matches.append({
@@ -143,11 +163,11 @@ def match(payments: List[Dict[str, Any]], invoices: List[Dict[str, Any]]) -> Dic
             })
             matched_payments.add(p_id)
             matched_invoices.add(inv_id)
-            
+
     # Compile unassigned / rejected items
     rejected_payments = [p_id for p_id in p_ids if p_id not in matched_payments]
     rejected_invoices = [inv_id for inv_id in inv_ids if inv_id not in matched_invoices]
-    
+
     return {
         "accepted_matches": accepted_matches,
         "rejected_payments": rejected_payments,

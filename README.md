@@ -29,7 +29,7 @@ ReconIQ takes a batch of payments, invoices, bank credits and related records, t
 - **Asymmetric-risk matching**: wrong links are treated as roughly 5x costlier than unresolved payments (a wrong link costs 5 units, suspense costs 1).
 - **Confidence-gated posting**: payments post only above a confidence threshold, with a stricter threshold for ambiguous payer families.
 - **Budgeted verification queries**: at most 4 queries per run, one per decision step, never repeated for the same payment, and only when the expected avoided loss exceeds the query cost.
-- **Hard safety validator**: every posting is checked for duplicate invoice use, over-capture, cancelled invoices, merchant mismatch, currency mismatch and review capacity before being returned.
+- **Hard safety validator**: every posting is checked for duplicate payment use, split-capture over-capture, cancelled invoices, merchant mismatch, currency mismatch and review capacity before being returned.
 - **Fail-safe by default**: any exception falls back to a posting with *zero* allocations and every payment unresolved.
 - **Idempotent input handling**: retried deliveries of transactions, bank credits and remittance documents are de-duplicated.
 - **JSON-serializable state** that can be persisted between decision steps.
@@ -60,7 +60,7 @@ raw observation
 2. Build a ranked candidate list for each payment.
 3. Ingest any verified answers from earlier queries. Verified answers are authoritative, **including a `null` answer, which leaves the payment unresolved**.
 4. If a query is worth its cost, return `{"type": "query", "payment_id": ...}`.
-5. Otherwise build allocations, run `validate_posting()`, and return `{"type": "post", "allocations": [...], "unresolved": [...]}`.
+5. Otherwise build allocations, run `validate_posting()`, and return `{"type": "post", "allocations": [...], "unresolved": [...]}`. Multiple receipts may settle one invoice only while its outstanding balance is respected.
 
 **Query selection** (`query.py`): a payment is queried only if it has two or more candidates, the top two are within 0.15 confidence (or the hints conflict), and `amount × (1 − top_confidence) × 4 > 180`.
 
@@ -207,12 +207,10 @@ Optional modules are imported if present; otherwise the system falls back to lea
 
 ## Project Status
 
-ReconIQ is under active development. Known gaps in the current snapshot:
-
-- **Integration wiring is incomplete.** `solution.py` imports `match_payment` from `matcher.py`, but `matcher.py` currently exposes `match()` and `generate_candidates()`. `prepare()` returns a cleaned observation dict while `solution.py` expects a `(payments, invoices)` tuple. Until these line up, the fail-safe path leaves payments unresolved unless `candidates` are supplied in the observation.
-- **`parser.py` / `models.py`** are early drafts (`load_batch` does not yet populate every `Batch` field).
-- **Naming**: some module docstrings still say "EcoRecon", the project's earlier working name.
-- `local_check.py`, referenced in older notes, is not part of this repository.
+The decision engine, parser/model integration, duplicate handling, split-capture limits,
+query budget, and posting validator are implemented. The repository does not contain the
+challenge's separately distributed `local_check.py`; when available, run it against the
+submitted `solution.py` in the challenge environment.
 
 ## Contributing
 

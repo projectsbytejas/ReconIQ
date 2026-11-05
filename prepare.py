@@ -38,7 +38,11 @@ def prepare(observation):
     # -----------------------
     # Payments
     # -----------------------
-    for payment in obs.get("payments", []):
+    payments = obs.get("payments", [])
+    if not payments:
+        payments = obs.get("transactions", [])
+    obs["payments"] = _dedupe(payments, "payment_id")
+    for payment in obs["payments"]:
 
         payment["currency"] = _clean_currency(
             payment.get("currency")
