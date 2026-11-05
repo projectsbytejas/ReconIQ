@@ -1,0 +1,120 @@
+"""
+matcher.py - Matching Engine for EcoRecon
+
+Orchestrates candidate generation, confidence scoring, and optimal assignment 
+while rejecting low-confidence links to avoid costly false matches.
+"""
+
+from typing import List, Dict, Any, Tuple
+from scipy.optimize import linear_sum_assignment
+import numpy as np
+from scorer import score, HIGH_CONFIDENCE_THRESHOLD
+
+
+def generate_candidates(payments: List[Dict[str, Any]], invoices: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    """
+    Generate plausible payment-invoice candidate pairs based on fast heuristic filters
+    (e.g., currency matching, loose date proximity, and non-zero amount overlaps).
+    
+    Do NOT parse files or handle queries here.
+    """
+    candidates = []
+    
+    for p in payments:
+        p_id = p.get("id") or p.get("payment_id")
+        p_curr = str(p.get("currency", "")).upper()
+        p_amt = float(p.get("amount", 0.0))
+        
+        for inv in invoices:
+            inv_id = inv.get("id") or inv.get("invoice_id")
+            inv_curr = str(inv.get("currency", "")).upper()
+            
+            # Fast prune: currency mismatch
+            if p_curr and inv_curr and p_curr != inv_curr:
+                continue
+                
+            # Fast prune: extreme amount mismatch or non-positive amounts
+            inv_bal = float(inv.get("remaining_balance", inv.get("amount", 0.0)))
+            if p_amt <= 0 or inv_bal <= 0 or p_amt > (inv_bal * 3.0) or inv_bal > (p_amt * 3.0):
+                continue
+                
+            candidates.append((p_id, inv_id))
+            
+    return candidates
+
+
+def match(payments: List[Dict[str, Any]], invoices: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Executes the full matching pipeline:
+    1. Generate candidates.
+    2. Score candidate pairs.
+    3. Perform optimal assignment (global optimization using scipy).
+    4. Filter out low confidence matches (leaving unresolved is preferred over wrong matches).
+    
+    Returns:
+        Dict containing:
+            - 'accepted_matches': List of high-confidence matches with scores.
+            - 'rejected_payments': List of payment IDs left unresolved.
+            - 'rejected_invoices': List of invoice IDs left unresolved.
+    """
+    # Map IDs to objects for fast lookup
+    payment_map = {p.get("id") or p.get("payment_id"): p for p in payments}
+    invoice_map = {inv.get("id") or inv.get("invoice_id"): inv for inv in invoices}
+    
+    p_ids = list(payment_map.keys())
+    inv_ids = list(invoice_map.keys())
+    
+    if not p_ids or not inv_ids:
+        return {
+            "accepted_matches": [],
+            "rejected_payments": p_ids,
+            "rejected_invoices": inv_ids
+        }
+
+    # Build cost/score matrix (rows: payments, cols: invoices)
+    score_matrix = np.zeros((len(p_ids), len(inv_ids)))
+    candidate_pairs = set(generate_candidates(payments, invoices))
+    
+    for i, p_id in enumerate(p_ids):
+        for j, inv_id in enumerate(inv_ids):
+            if (p_id, inv_id) not in candidate_pairs:
+                continue
+
+            confidence = score(payment_map[p_id], invoice_map[inv_id])
+            if confidence >= HIGH_CONFIDENCE_THRESHOLD:
+                score_matrix[i, j] = confidence
+
+    # Convert scores to costs for linear_sum_assignment (Maximizing score == Minimizing negative score)
+    cost_matrix = -score_matrix
+    
+    # Solve optimal bipartite matching
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    
+    accepted_matches = []
+    matched_payments = set()
+    matched_invoices = set()
+    
+    for r, c in zip(row_ind, col_ind):
+        p_id = p_ids[r]
+        inv_id = inv_ids[c]
+        confidence = float(score_matrix[r, c])
+        
+        # Enforce high confidence threshold (Never guess rule)
+        if confidence >= HIGH_CONFIDENCE_THRESHOLD:
+            accepted_matches.append({
+                "payment_id": p_id,
+                "invoice_id": inv_id,
+                "confidence_score": confidence
+            })
+            matched_payments.add(p_id)
+            matched_invoices.add(inv_id)
+            
+    # Compile unassigned / rejected items
+    rejected_payments = [p_id for p_id in p_ids if p_id not in matched_payments]
+    rejected_invoices = [inv_id for inv_id in inv_ids if inv_id not in matched_invoices]
+    
+    return {
+        "accepted_matches": accepted_matches,
+        "rejected_payments": rejected_payments,
+        "rejected_invoices": rejected_invoices
+    }
