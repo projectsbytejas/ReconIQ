@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 import query as query_policy
 from query import MAX_QUERIES, choose_query, record_query
+from rules import score_candidates as teammate_score_candidates
 
 ACCEPT_THRESHOLD = 0.85
 AMBIGUOUS_THRESHOLD = 0.92
@@ -67,6 +68,12 @@ def _candidate_map(
     result: dict[str, list[dict[str, Any]]] = {}
     for payment in payments:
         pid = str(payment["payment_id"])
+        payment_value = sum(
+            max(0, int(transaction.get("gross", 0)))
+            for transaction in observation.get("transactions", [])
+            if str(transaction.get("payment_id")) == pid
+        )
+        scoring_payment = {**payment, "amount": payment_value}
         docs = _documents(observation, pid)
         scored: list[dict[str, Any]] = []
         for invoice in invoices:
@@ -91,6 +98,20 @@ def _candidate_map(
                 if source.get("sender_name") and _token(source.get("sender_name")) == _token(invoice.get("customer_name")):
                     score += 0.05
             scored.append({"invoice_id": invoice["invoice_id"], "confidence": min(1.0, score)})
+        try:
+            ranked = teammate_score_candidates(scoring_payment, invoices)
+            real_scores = {
+                str(invoice.get("invoice_id")): float(raw_score) / 100.0
+                for invoice, raw_score in ranked
+            }
+            if real_scores:
+                for candidate in scored:
+                    candidate["confidence"] = max(
+                        candidate["confidence"],
+                        max(0.0, min(1.0, real_scores.get(candidate["invoice_id"], 0.0))),
+                    )
+        except (TypeError, ValueError, KeyError):
+            pass
         result[pid] = sorted(scored, key=lambda x: x["confidence"], reverse=True)
     return result
 
