@@ -1,9 +1,3 @@
-<<<<<<< HEAD
-# ReconIQ (hackathon-ready)
-Single-file solution: `solution.py`. See `DEVELOPMENT.md` for the interface (`op: query` /
-`op: submit`), deduplication rules, query lifecycle, ledger formulas and verified scores.
-The old `type: post` / `allocations` / review-capacity design has been removed.
-=======
 # ReconIQ
 
 **A conservative payment-reconciliation engine that matches incoming payments to invoices, and knows when to leave a payment unresolved.**
@@ -230,6 +224,4 @@ Contributions are welcome.
 When changing matching or posting logic, keep the core principle intact: **when in doubt, leave it unresolved.**
 
 ## License
-
-No license has been specified yet. Add a `LICENSE` file (for example MIT or Apache-2.0) before publishing if you want others to be able to use the code.
->>>>>>> d36be3a4411b3faf5f56864ad3a767f07214e2ee
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
