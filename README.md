@@ -69,9 +69,10 @@ Run the checker with `python local_check.py solution.py training.json` (or
 
 Training-only tuning selected `ACCEPT_THRESHOLD = 0.85`,
 `AMBIGUOUS_THRESHOLD = 0.92`, minimum query value `180`, and top-two
-closeness `0.15`. The resulting average scores were **65.2270** on training
-(60 batches) and **54.8853** on practice (20 batches); both evaluations
-reported zero integrity violations. Practice was evaluated once after tuning.
+closeness `0.15`. With the integrated matcher, the average scores were
+**53.7947** on training (60 batches) and **45.5308** on practice (20 batches);
+both evaluations reported zero integrity violations. Practice was evaluated
+once after tuning.
 Verified query answers are authoritative, including a null answer, which
 remains unresolved. Every final posting supplies complete ledger rows and
 passes duplicate, capture, cancellation, merchant, currency, and conservation
@@ -87,7 +88,7 @@ ReconIQ/
 ├── query.py                 # expected-value query selection
 ├── prepare.py               # input normalisation and de-duplication
 ├── rules.py                 # rule-based candidate scoring and balance checks
-├── scorer.py                # weighted confidence scoring (rapidfuzz)
+├── scorer.py                # weighted confidence scoring (stdlib difflib)
 ├── matcher.py               # candidate generation + optimal assignment (scipy)
 ├── parser.py                # observation → typed objects (work in progress)
 ├── models.py                # dataclasses: Invoice, Payment, BankCredit, Refund, Batch
@@ -105,7 +106,7 @@ ReconIQ/
 
 - Python 3.10+ (the code uses `X | None` type syntax)
 - The decision layer (`solution.py`, `query.py`) is dependency-free.
-- The scoring and matching engine additionally needs `numpy`, `scipy` and `rapidfuzz`.
+- The scoring and matching engine additionally needs `numpy` and `scipy`.
 - `pytest` is needed for `test_matcher_scorer.py`.
 
 ### Installation
@@ -117,7 +118,7 @@ cd ReconIQ
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-pip install numpy scipy rapidfuzz pytest
+pip install numpy scipy pytest
 ```
 
 ## Usage

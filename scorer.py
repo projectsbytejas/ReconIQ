@@ -6,8 +6,8 @@ Designed to strongly discourage incorrect matches (false positives cost ~5x more
 """
 
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Dict, Any, Optional
-from rapidfuzz import fuzz
 
 # ==============================================================================
 # CONFIGURATION & WEIGHTS
@@ -27,19 +27,19 @@ MAX_DATE_DIFFERENCE_DAYS = 45
 
 def score_amount(payment_amount: float, invoice_remaining_balance: float) -> float:
     """
-    Score the amount proximity. Exact matches get 1.0. 
+    Score the amount proximity. Exact matches get 1.0.
     Overpayments or partial matches scale down smoothly.
     """
     if payment_amount <= 0 or invoice_remaining_balance <= 0:
         return 0.0
-    
+
     if payment_amount == invoice_remaining_balance:
         return 1.0
-    
+
     diff = abs(payment_amount - invoice_remaining_balance)
     max_val = max(payment_amount, invoice_remaining_balance)
     ratio = diff / max_val
-    
+
     score = max(0.0, 1.0 - ratio)
     return score
 
@@ -55,8 +55,9 @@ def score_text_similarity(val1: Optional[str], val2: Optional[str]) -> float:
     """Compute token-set string similarity using rapidfuzz."""
     if not val1 or not val2:
         return 0.0
-    similarity = fuzz.token_sort_ratio(str(val1), str(val2))
-    return similarity / 100.0
+    left = " ".join(sorted(str(val1).lower().split()))
+    right = " ".join(sorted(str(val2).lower().split()))
+    return SequenceMatcher(None, left, right).ratio()
 
 
 def score_date_proximity(payment_date: Any, invoice_date: Any) -> float:
@@ -112,29 +113,29 @@ def score_status(invoice_status: Optional[str]) -> float:
 def score(payment: Dict[str, Any], invoice: Dict[str, Any]) -> float:
     """Computes a weighted confidence score between 0.0 and 1.0 for a payment-invoice pair."""
     s_amount = score_amount(
-        payment.get("amount", 0.0), 
+        payment.get("amount", 0.0),
         invoice.get("remaining_balance", invoice.get("amount", 0.0))
     )
-    
+
     s_curr = score_currency(payment.get("currency"), invoice.get("currency"))
     if s_curr == 0.0:
         return 0.0
 
     s_merchant = score_text_similarity(
-        payment.get("merchant", payment.get("payer")), 
+        payment.get("merchant", payment.get("payer")),
         invoice.get("merchant", invoice.get("customer"))
     )
-    
+
     s_reference = score_text_similarity(
-        payment.get("reference", payment.get("memo")), 
+        payment.get("reference", payment.get("memo")),
         invoice.get("reference", invoice.get("invoice_number"))
     )
-    
+
     s_date = score_date_proximity(
-        payment.get("date", payment.get("payment_date")), 
+        payment.get("date", payment.get("payment_date")),
         invoice.get("date", invoice.get("invoice_date"))
     )
-    
+
     s_status = score_status(invoice.get("status"))
 
     total_score = (

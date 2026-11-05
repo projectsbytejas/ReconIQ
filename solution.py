@@ -10,6 +10,11 @@ import query as query_policy
 from query import MAX_QUERIES, choose_query, record_query
 from rules import score_candidates as teammate_score_candidates
 
+try:
+    from matcher import match as teammate_match
+except (ImportError, ModuleNotFoundError):
+    teammate_match = None
+
 ACCEPT_THRESHOLD = 0.85
 AMBIGUOUS_THRESHOLD = 0.92
 
@@ -66,6 +71,16 @@ def _candidate_map(
     invoices: Sequence[Mapping[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {}
+    matcher_scores: dict[str, dict[str, float]] = {}
+    if teammate_match is not None:
+        try:
+            matched = teammate_match(list(payments), list(invoices))
+            matcher_scores = {
+                str(item["payment_id"]): {str(item["invoice_id"]): float(item["confidence_score"])}
+                for item in matched.get("accepted_matches", [])
+            }
+        except (TypeError, ValueError, KeyError):
+            matcher_scores = {}
     for payment in payments:
         pid = str(payment["payment_id"])
         payment_value = sum(
@@ -112,6 +127,11 @@ def _candidate_map(
                     )
         except (TypeError, ValueError, KeyError):
             pass
+        for candidate in scored:
+            candidate["confidence"] = max(
+                candidate["confidence"],
+                matcher_scores.get(pid, {}).get(candidate["invoice_id"], 0.0),
+            )
         result[pid] = sorted(scored, key=lambda x: x["confidence"], reverse=True)
     return result
 
