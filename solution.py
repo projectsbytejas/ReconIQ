@@ -1,300 +1,382 @@
-"""Integration decision function for payment reconciliation.
+"""Conservative deterministic payment-to-invoice reconciliation.
 
-Teammate parser/rule/matcher modules are optional.  When they are added, expose
-the functions documented in ``interfaces.md`` and update the three imports in
-``_integrations``; the safety validator remains the final authority.
+The implementation deliberately treats conflicting references as uncertainty.
+It deduplicates transactions and bank credits by their stable IDs, uses a
+one-to-one payment-group/invoice assignment, and spends the limited query
+budget on high-value assignments with conflicting evidence.
 """
+import re
 
-from __future__ import annotations
-
-import json
-from typing import Any, Mapping, Sequence
-
-from query import MAX_QUERIES, choose_query, record_query
-
-ACCEPT_THRESHOLD = 0.85
-AMBIGUOUS_THRESHOLD = 0.92
-REVIEW_CAPACITY = 4
+FIELDS = ("captured", "refunded", "fees", "net")
 
 
-def _id(record: Mapping[str, Any], *names: str) -> str:
-    for name in names:
-        value = record.get(name)
-        if value is not None and value != "":
-            return str(value)
-    return ""
+def _norm_text(value):
+    return str(value or "").strip().lower()
 
 
-def _amount(record: Mapping[str, Any]) -> int:
-    for name in ("amount", "gross", "value", "minor_units"):
-        try:
-            return abs(int(record.get(name, 0)))
-        except (TypeError, ValueError):
+def _norm_currency(value):
+    return str(value or "").strip().upper()
+
+
+def _norm_tax(value):
+    return str(value or "").strip()
+
+
+def _norm_ref(value):
+    # Invoice references in the supplied data contain formatting noise
+    # (spaces, slashes, hyphens and case differences).
+    return "".join(re.findall(r"[0-9]+", str(value or "")))
+
+
+def _tokens(value):
+    return set(re.findall(r"[a-z0-9]+", _norm_text(value)))
+
+
+def _unique_rows(rows, key):
+    result = {}
+    for row in rows:
+        # Match the public runner's last-observation-wins deduplication.
+        result[row[key]] = row
+    return list(result.values())
+
+
+def _prepare(observation):
+    # Work on new lists; do not mutate the observation supplied by the runner.
+    obs = dict(observation)
+    obs["payments"] = [dict(p, currency=_norm_currency(p.get("currency")))
+                       for p in observation.get("payments", [])]
+    obs["invoices"] = [dict(i, currency=_norm_currency(i.get("currency")))
+                       for i in observation.get("invoices", [])]
+    obs["transactions"] = _unique_rows(observation.get("transactions", []),
+                                       "transaction_id")
+    obs["bank_credits"] = _unique_rows(observation.get("bank_credits", []),
+                                       "bank_id")
+    obs["remittance_documents"] = list(observation.get("remittance_documents", []))
+    obs["investigations"] = list(observation.get("investigations", []))
+    return obs
+
+
+def _payment_transactions(obs):
+    by_payment = {}
+    for tx in obs["transactions"]:
+        by_payment.setdefault(tx["payment_id"], []).append(tx)
+    return by_payment
+
+
+def _payment_value(payment_id, by_payment):
+    return sum(max(0, tx["gross"]) for tx in by_payment.get(payment_id, []))
+
+
+def _payment_refunded(payment_id, by_payment):
+    return sum(max(0, -tx["gross"]) for tx in by_payment.get(payment_id, []))
+
+
+def _docs_for_payment(obs, payment_id):
+    return [d for d in obs["remittance_documents"]
+            if d.get("payment_id") == payment_id and d.get("status") == "active"]
+
+
+def _independent_documents(docs):
+    # Processor receipts repeat the raw payment evidence.  Other documents
+    # are collapsed by lineage so a copied document is not counted twice.
+    groups = {}
+    for doc in docs:
+        if doc.get("source") == "processor_receipt":
             continue
-    return 0
+        lineage = doc.get("lineage") or doc.get("document_id")
+        groups.setdefault(lineage, doc)
+    return list(groups.values())
 
 
-def _currency(record: Mapping[str, Any]) -> str:
-    return str(record.get("currency", record.get("currency_code", ""))).upper()
+def _pair_evidence(payment, invoice, docs):
+    invoice_ref = _norm_ref(invoice.get("reference"))
+    payment_ref = _norm_ref(payment.get("source_ref"))
+    payment_tax = _norm_tax(payment.get("tax_suffix"))
+    invoice_tax = _norm_tax(invoice.get("tax_suffix"))
 
-
-def _merchant(record: Mapping[str, Any]) -> str:
-    return str(record.get("merchant_id", record.get("merchant", "")))
-
-
-def _records(observation: Mapping[str, Any], name: str) -> list[dict[str, Any]]:
-    value = observation.get(name, [])
-    return [dict(item) for item in value] if isinstance(value, list) else []
-
-
-def _integrations(
-    observation: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any]:
-    """Use teammate modules when present, otherwise use explicit TODO stubs."""
-    # TODO(teammate-1/2): replace these optional imports with landed modules.
-    parser = None
-    rule_engine = None
-    matcher = None
-    try:
-        from prepare import prepare as parser # type: ignore
-    except ImportError:
-        pass
-    try:
-        from rules import score_candidates as rule_engine  # type: ignore
-    except ImportError:
-        pass
-    try:
-        from matcher import match_payment as matcher  # type: ignore
-    except ImportError:
-        pass
-    if parser is not None:
-        payments, invoices = parser(observation)
-        return [dict(item) for item in payments], [dict(item) for item in invoices], matcher
-    return (
-        _records(observation, "payments") or _records(observation, "transactions"),
-        _records(observation, "invoices"),
-        matcher,
+    independent = _independent_documents(docs)
+    independent_ref = any(
+        invoice_ref and _norm_ref(d.get("reference")) == invoice_ref
+        for d in independent
+    )
+    independent_tax = any(
+        invoice_tax and _norm_tax(d.get("tax_suffix")) == invoice_tax
+        for d in independent
+    )
+    independent_joint = any(
+        invoice_ref
+        and _norm_ref(d.get("reference")) == invoice_ref
+        and invoice_tax
+        and _norm_tax(d.get("tax_suffix")) == invoice_tax
+        for d in independent
     )
 
-
-def _unique_payments(
-    payments: Sequence[Mapping[str, Any]], state: dict[str, Any]
-) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    unique: list[dict[str, Any]] = []
-    duplicate_map = dict(state.get("duplicate_map", {}))
-    for payment in payments:
-        payment_id = _id(payment, "payment_id", "id", "transaction_id")
-        duplicate_of = _id(payment, "duplicate_of", "duplicate_transaction_id")
-        key = duplicate_of or payment_id
-        if key and key in seen:
-            if payment_id:
-                duplicate_map[payment_id] = key
-            continue
-        if key:
-            seen.add(key)
-        unique.append(dict(payment))
-    state["duplicate_map"] = duplicate_map
-    return unique
-
-
-def _candidate_map(
-    observation: Mapping[str, Any],
-    payments: Sequence[Mapping[str, Any]],
-    invoices: Sequence[Mapping[str, Any]],
-    matcher: Any = None,
-) -> dict[str, list[dict[str, Any]]]:
-    supplied = observation.get("candidates", observation.get("matches", {}))
-    by_id = {_id(invoice, "invoice_id", "id"): invoice for invoice in invoices}
-    result: dict[str, list[dict[str, Any]]] = {}
-    for payment in payments:
-        pid = _id(payment, "payment_id", "id", "transaction_id")
-        raw = supplied.get(pid, []) if isinstance(supplied, dict) else []
-        if not raw and matcher is not None:
-            raw = matcher(payment, invoices)
-        if not raw:
-            raw = payment.get("candidates", [])
-        options: list[dict[str, Any]] = []
-        for item in raw if isinstance(raw, list) else []:
-            candidate = {"invoice_id": item} if isinstance(item, str) else dict(item)
-            iid = _id(candidate, "invoice_id", "id")
-            candidate["invoice_id"] = iid
-            candidate["invoice"] = by_id.get(iid, candidate.get("invoice", {}))
-            try:
-                candidate["confidence"] = max(
-                    0.0, min(1.0, float(candidate.get("confidence", candidate.get("score", 0.0))))
-                )
-            except (TypeError, ValueError):
-                candidate["confidence"] = 0.0
-            if iid:
-                options.append(candidate)
-        result[pid] = sorted(options, key=lambda item: item["confidence"], reverse=True)
-    return result
-
-
-def _query_answer(observation: Mapping[str, Any], payment_id: str) -> tuple[bool, Any]:
-    answers = observation.get("query_results", observation.get("query_answer", {}))
-    if isinstance(answers, dict) and payment_id in answers:
-        return True, answers[payment_id]
-    return False, None
-
-
-def _valid_link(payment: Mapping[str, Any], invoice: Mapping[str, Any]) -> bool:
-    if invoice.get("cancelled", invoice.get("status") == "cancelled"):
-        return False
-    return not (
-        _currency(payment)
-        and _currency(invoice)
-        and _currency(payment) != _currency(invoice)
-    ) and not (
-        _merchant(payment)
-        and _merchant(invoice)
-        and _merchant(payment) != _merchant(invoice)
+    # A processor receipt is correlated with the raw payment record, so it
+    # is intentionally not treated as an independent reference source.
+    payment_reference_match = bool(
+        invoice_ref and payment_ref and invoice_ref == payment_ref
     )
+    tax_match = bool(payment_tax and invoice_tax and payment_tax == invoice_tax)
+    name_overlap = len(_tokens(payment.get("sender_name")) &
+                       _tokens(invoice.get("customer_name")))
 
-
-def _build_allocations(
-    payments: Sequence[Mapping[str, Any]],
-    invoices: Mapping[str, Mapping[str, Any]],
-    candidates: Mapping[str, Sequence[Mapping[str, Any]]],
-    state: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    allocations: list[dict[str, Any]] = []
-    unresolved: list[str] = []
-    used: set[str] = set()
-    captured: dict[str, int] = {}
-    verified = state.get("query_results", {})
-    for payment in payments:
-        pid = _id(payment, "payment_id", "id", "transaction_id")
-        if pid in verified:
-            chosen = verified[pid]
-            if chosen is None:
-                unresolved.append(pid)
-                continue
-            iid = _id(chosen if isinstance(chosen, dict) else {"id": chosen}, "invoice_id", "id")
-        else:
-            options = list(candidates.get(pid, ()))
-            if not options:
-                unresolved.append(pid)
-                continue
-            chosen = options[0]
-            confidence = float(chosen.get("confidence", 0.0))
-            second = float(options[1].get("confidence", 0.0)) if len(options) > 1 else 0.0
-            family = bool(payment.get("payer_family", payment.get("ambiguous_payer_family", False)))
-            threshold = AMBIGUOUS_THRESHOLD if family or confidence - second <= 0.15 else ACCEPT_THRESHOLD
-            iid = _id(chosen, "invoice_id", "id")
-            if confidence < threshold:
-                unresolved.append(pid)
-                continue
-        invoice = invoices.get(iid)
-        amount = _amount(payment)
-        if (
-            not iid
-            or invoice is None
-            or iid in used
-            or not _valid_link(payment, invoice)
-            or captured.get(iid, 0) + amount > _amount(invoice)
-        ):
-            unresolved.append(pid)
-            continue
-        used.add(iid)
-        captured[iid] = captured.get(iid, 0) + amount
-        allocations.append({"payment_id": pid, "invoice_id": iid, "amount": amount})
-    return allocations, unresolved
-
-
-def _within_capacity(observation: Mapping[str, Any], unresolved: Sequence[str]) -> bool:
-    capacity = observation.get(
-        "review_capacity",
-        observation.get("capacity", observation.get("max_reviews", REVIEW_CAPACITY)),
-    )
-    try:
-        return len(unresolved) <= int(capacity)
-    except (TypeError, ValueError):
-        return False
-
-
-def validate_posting(
-    observation: Mapping[str, Any],
-    payments: Sequence[Mapping[str, Any]],
-    invoices: Mapping[str, Mapping[str, Any]],
-    allocations: Sequence[Mapping[str, Any]],
-    unresolved: Sequence[str],
-) -> bool:
-    """Final hard safety filter; unresolved payments are always safe."""
-    if not _within_capacity(observation, unresolved):
-        return False
-    seen: set[str] = set()
-    captured: dict[str, int] = {}
-    payment_map = {_id(item, "payment_id", "id", "transaction_id"): item for item in payments}
-    for allocation in allocations:
-        pid = str(allocation.get("payment_id", ""))
-        iid = str(allocation.get("invoice_id", ""))
-        payment = payment_map.get(pid)
-        invoice = invoices.get(iid)
-        amount = _amount(allocation)
-        if not payment or not invoice or iid in seen or amount != _amount(payment):
-            return False
-        if not _valid_link(payment, invoice):
-            return False
-        captured[iid] = captured.get(iid, 0) + amount
-        if captured[iid] > _amount(invoice):
-            return False
-        seen.add(iid)
-    return True
-
-
-def _safe_baseline(
-    observation: Mapping[str, Any],
-    state: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    current = {
-        "queries_used": min(MAX_QUERIES, int((state or {}).get("queries_used", 0) or 0)),
-        "queried": list((state or {}).get("queried", []))[:MAX_QUERIES],
-        "query_results": dict((state or {}).get("query_results", {})),
-        "duplicate_map": dict((state or {}).get("duplicate_map", {})),
-        "pending": [],
-        "phase": "final",
+    return {
+        "payment_reference": payment_reference_match,
+        "independent_reference": independent_ref,
+        "tax_match": tax_match,
+        "independent_tax": independent_tax,
+        "independent_joint": independent_joint,
+        "name_overlap": name_overlap,
     }
-    payments = _records(observation, "payments") or _records(observation, "transactions")
-    current["pending"] = [_id(item, "payment_id", "id", "transaction_id") for item in payments]
-    return {"action": {"type": "post", "allocations": [], "unresolved": current["pending"]}, "state": current}
 
 
-def decide(
-    observation: Mapping[str, Any], state: Mapping[str, Any] | None = None
-) -> dict[str, Any]:
-    """Return one query action or a validated final posting."""
-    try:
-        current = dict(state or {})
-        current.setdefault("queries_used", 0)
-        current.setdefault("queried", [])
-        current.setdefault("query_results", {})
-        current.setdefault("duplicate_map", {})
-        current.setdefault("pending", [])
-        current["queries_used"] = min(MAX_QUERIES, int(current["queries_used"]))
-        payments, invoice_list, matcher = _integrations(observation)
-        payments = _unique_payments(payments, current)
-        invoices = {_id(item, "invoice_id", "id"): item for item in invoice_list}
-        candidates = _candidate_map(observation, payments, invoice_list, matcher)
-        for pid in list(current["queried"]):
-            if pid not in current["query_results"]:
-                found, answer = _query_answer(observation, pid)
-                if found:
-                    current["query_results"][pid] = answer
-        query_id = choose_query(payments, candidates, current)
-        if query_id is not None:
-            return {"action": {"type": "query", "payment_id": query_id}, "state": record_query(current, query_id)}
-        allocations, unresolved = _build_allocations(payments, invoices, candidates, current)
-        if not validate_posting(observation, payments, invoices, allocations, unresolved):
-            return _safe_baseline(observation, current)
-        current["pending"] = list(unresolved)
-        current["phase"] = "final"
-        result = {
-            "action": {"type": "post", "allocations": allocations, "unresolved": unresolved},
-            "state": current,
+def _candidate_options(obs, payment, by_payment):
+    payment_id = payment["payment_id"]
+    captured = _payment_value(payment_id, by_payment)
+    refunded = _payment_refunded(payment_id, by_payment)
+    if captured <= 0:
+        return []
+
+    docs = _docs_for_payment(obs, payment_id)
+    options = []
+
+    for invoice in obs["invoices"]:
+        if invoice["merchant"] != payment.get("merchant"):
+            continue
+        if invoice["currency"] != payment.get("currency"):
+            continue
+        if invoice["amount"] < captured:
+            continue
+        if invoice.get("status") == "cancelled" and refunded != captured:
+            continue
+
+        ev = _pair_evidence(payment, invoice, docs)
+        if not ev["name_overlap"]:
+            continue
+
+        # High-confidence deterministic rule: a matching tax suffix plus
+        # either the payment reference or an independent remittance reference.
+        has_reference = (ev["payment_reference"] or
+                         ev["independent_reference"])
+        if not (ev["tax_match"] and has_reference):
+            continue
+
+        # Prefer corroboration from both independent document and payment
+        # reference, but do not count duplicate lineage as multiple votes.
+        score = (
+            100 * int(ev["tax_match"])
+            + 20 * int(ev["payment_reference"])
+            + 15 * int(ev["independent_reference"])
+            + 5 * int(ev["independent_joint"])
+            + 2 * min(ev["name_overlap"], 2)
+            + int(invoice["amount"] == captured)
+        )
+        options.append((score, invoice["invoice_id"], ev))
+
+    options.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return options
+
+
+def _reference_conflicts(obs, payment_id, assigned_invoice_id):
+    invoice_by_ref = {}
+    invoice_by_id = {}
+    for invoice in obs["invoices"]:
+        invoice_by_id[invoice["invoice_id"]] = invoice
+        ref = _norm_ref(invoice.get("reference"))
+        if ref:
+            invoice_by_ref[ref] = invoice["invoice_id"]
+
+    payment = next((p for p in obs["payments"]
+                    if p["payment_id"] == payment_id), None)
+    if payment is None:
+        return False, False
+
+    # Include void/superseded documents when detecting a conflict. They are
+    # not positive matching evidence, but they can reveal a contradictory
+    # reference that makes an otherwise plausible assignment unsafe.
+    docs = [d for d in obs["remittance_documents"]
+            if d.get("payment_id") == payment_id]
+    observed_refs = set()
+    for doc in docs:
+        ref = _norm_ref(doc.get("reference"))
+        if ref in invoice_by_ref:
+            observed_refs.add(ref)
+
+    payment_ref = _norm_ref(payment.get("source_ref"))
+    payment_ref_invoice = invoice_by_ref.get(payment_ref)
+    multiple_document_targets = len(observed_refs) > 1
+    source_conflict = bool(
+        payment_ref_invoice and payment_ref_invoice != assigned_invoice_id
+    )
+    return multiple_document_targets, source_conflict
+
+
+def _build_mapping(obs):
+    by_payment = _payment_transactions(obs)
+    verified = {}
+    verified_payments = set()
+    for result in obs.get("investigations", []):
+        pid = result.get("payment_id")
+        if pid is None:
+            continue
+        verified_payments.add(pid)
+        iid = result.get("verified_invoice_id")
+        if iid is not None:
+            verified[pid] = iid
+
+    mapping = dict(verified)
+    used_invoices = set(mapping.values())
+    choices = {}
+
+    for payment in obs["payments"]:
+        pid = payment["payment_id"]
+        if pid in verified_payments:
+            continue
+        options = _candidate_options(obs, payment, by_payment)
+        choices[pid] = options
+        if not options:
+            continue
+
+        # If the best candidate is not clearly better than another invoice,
+        # abstain instead of making an unsafe assignment.
+        if len(options) > 1 and options[0][0] - options[1][0] < 10:
+            continue
+        choices[pid] = options
+
+    # Resolve invoice collisions by strongest evidence.  Equal/near-equal
+    # competing payments are both left unresolved.
+    proposed = []
+    for pid, options in choices.items():
+        if options and (len(options) == 1 or
+                        options[0][0] - options[1][0] >= 10):
+            proposed.append((options[0][0], pid, options[0][1]))
+    by_invoice = {}
+    for score, pid, iid in proposed:
+        if iid in used_invoices:
+            continue
+        by_invoice.setdefault(iid, []).append((score, pid))
+
+    for iid, contenders in by_invoice.items():
+        contenders.sort(reverse=True)
+        if len(contenders) > 1 and contenders[0][0] - contenders[1][0] < 15:
+            continue
+        mapping[contenders[0][1]] = iid
+        used_invoices.add(iid)
+
+    return mapping, choices, verified_payments, by_payment
+
+
+def _query_candidate(obs, mapping, choices, verified_payments, by_payment):
+    remaining = int(obs.get("queries_remaining", 0) or 0)
+    if remaining <= 0:
+        return None
+
+    invoice_by_id = {
+        invoice["invoice_id"]: invoice for invoice in obs["invoices"]
+    }
+    payment_by_id = {
+        payment["payment_id"]: payment for payment in obs["payments"]
+    }
+    risk = []
+    for pid, payment in payment_by_id.items():
+        if pid in verified_payments:
+            continue
+        value = _payment_value(pid, by_payment)
+        if value <= 0:
+            continue
+
+        if pid not in mapping:
+            # An unresolved payment with a strong candidate that lost a
+            # conflict/uniqueness check is highly likely to be matched.
+            # Otherwise, larger unresolved payments are still worth checking.
+            priority = value * (200 if choices.get(pid) else 20)
+            risk.append((priority, value, pid))
+            continue
+
+        assigned_invoice_id = mapping[pid]
+        invoice = invoice_by_id.get(assigned_invoice_id)
+        if invoice is None:
+            continue
+
+        multi_docs, source_conflict = _reference_conflicts(
+            obs, pid, assigned_invoice_id
+        )
+        evidence = _pair_evidence(
+            payment, invoice, _docs_for_payment(obs, pid)
+        )
+        weak_independent_support = not evidence["independent_reference"]
+        severity = (
+            1 * int(multi_docs)
+            + 4 * int(source_conflict)
+            + 4 * int(weak_independent_support)
+        )
+        if severity > 0:
+            # A review of a risky existing match can avoid a 5x wrong-match
+            # penalty; it is lower priority than an unresolved payment.
+            priority = value * 0.5 * severity
+            risk.append((priority, value, pid))
+
+    if risk:
+        risk.sort(reverse=True)
+        return risk[0][2]
+    return None
+
+def _accounting(obs, mapping, by_payment):
+    ledger = {
+        invoice["invoice_id"]: dict.fromkeys(FIELDS, 0)
+        for invoice in obs["invoices"]
+    }
+    suspense = dict.fromkeys(FIELDS, 0)
+
+    for tx in obs["transactions"]:
+        bucket = ledger.get(mapping.get(tx["payment_id"]))
+        if bucket is None:
+            bucket = suspense
+        bucket["captured"] += max(0, tx["gross"])
+        bucket["refunded"] += max(0, -tx["gross"])
+        bucket["fees"] += tx["fee"]
+        bucket["net"] += tx["net"]
+
+    rows = []
+    for invoice in obs["invoices"]:
+        balance = ledger[invoice["invoice_id"]]
+        rows.append({
+            "invoice_id": invoice["invoice_id"],
+            "captured": balance["captured"],
+            "refunded": balance["refunded"],
+            "fees": balance["fees"],
+            "net": balance["net"],
+            "remaining_due": (
+                invoice["amount"] - balance["captured"] + balance["refunded"]
+            ),
+        })
+
+    return {
+        "op": "submit",
+        "matches": [
+            {"payment_id": pid, "invoice_id": iid}
+            for pid, iid in mapping.items()
+        ],
+        "ledger": rows,
+        "suspense": suspense,
+        "bank_total": sum(row["amount"] for row in obs["bank_credits"]),
+    }
+
+
+def decide(observation, state):
+    obs = _prepare(observation)
+    mapping, choices, verified_payments, by_payment = _build_mapping(obs)
+
+    query_payment = _query_candidate(
+        obs, mapping, choices, verified_payments, by_payment
+    )
+    if query_payment is not None:
+        return {
+            "action": {"op": "query", "payment_id": query_payment},
+            "state": {},
         }
-        json.dumps(result)
-        return result
-    except Exception:
-        return _safe_baseline(observation, state)
+
+    return {
+        "action": _accounting(obs, mapping, by_payment),
+        "state": {},
+    }
