@@ -1,6 +1,9 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+from dataclasses import dataclass, field
+from typing import Optional
+
 @dataclass
 class Invoice:
     invoice_id: str
@@ -11,6 +14,8 @@ class Invoice:
     issue_day: int
     due_day: int
     status: str
+
+    captured_amount: int = 0
 
 @dataclass
 class Payment:

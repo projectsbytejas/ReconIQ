@@ -56,7 +56,7 @@ def _integrations(
     rule_engine = None
     matcher = None
     try:
-        from parser import parse_observation as parser  # type: ignore
+        from prepare import prepare as parser # type: ignore
     except ImportError:
         pass
     try:
