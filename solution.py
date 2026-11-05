@@ -1,301 +1,399 @@
-"""Conservative, stateful payment-to-invoice reconciliation decision engine."""
+"""ReconIQ v6 challenge solution.
+
+The submission is intentionally standalone: the challenge runner loads only this
+file.  All accounting is derived from unique transaction and bank identifiers.
+"""
 
 from __future__ import annotations
 
-import json
+import math
 import re
-from difflib import SequenceMatcher
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
-from query import MAX_QUERIES, choose_query, record_query
-
-ACCEPT_THRESHOLD = 0.85
-AMBIGUOUS_THRESHOLD = 0.92
-REVIEW_CAPACITY = 4
+try:
+    from scipy.optimize import linear_sum_assignment
+except ImportError:
+    linear_sum_assignment = None
 
 
-def _id(record: Mapping[str, Any], *names: str) -> str:
-    for name in names:
-        value = record.get(name)
-        if value is not None and value != "":
-            return str(value)
-    return ""
+MAX_QUERIES = 4
+MODEL_COEFFICIENTS = (
+    1.76, 1.20, 0.38, 0.92,
+    3.97, 1.11, 1.00, 0.67,
+    1.51, -1.24, 0.80, 0.44,
+    0.17, -0.78,
+)
+MODEL_INTERCEPT = -5.10
 
 
-def _amount(record: Mapping[str, Any]) -> int:
-    for name in ("amount", "gross", "value", "minor_units"):
-        try:
-            value = record.get(name)
-            if value is not None:
-                return int(value)
-        except (TypeError, ValueError):
-            continue
-    return 0
+def _norm(value: Any) -> str:
+    return str(value or "").strip().casefold()
 
 
-def _currency(record: Mapping[str, Any]) -> str:
-    return str(record.get("currency", record.get("currency_code", "")) or "").strip().upper()
+def _digits(value: Any) -> str:
+    return "".join(re.findall(r"\d+", str(value or "")))
 
 
-def _merchant(record: Mapping[str, Any]) -> str:
-    return str(record.get("merchant_id", record.get("merchant", record.get("merchant_name", ""))) or "").strip().casefold()
-
-
-def _text(record: Mapping[str, Any], *names: str) -> str:
-    for name in names:
-        value = record.get(name)
-        if value:
-            return str(value).strip().casefold()
-    return ""
-
-
-def _reference(record: Mapping[str, Any]) -> str:
-    return _text(record, "processor_reference", "reference", "remittance_reference", "memo", "description")
-
-
-def _reference_tokens(value: str) -> set[str]:
-    return {token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) >= 3}
-
-
-def _strong_reference(payment: Mapping[str, Any], invoice: Mapping[str, Any]) -> bool:
-    payment_ref = _reference(payment)
-    invoice_ref = _text(invoice, "invoice_reference", "reference", "invoice_number", "id", "invoice_id")
-    if not payment_ref or not invoice_ref:
-        return False
-    return payment_ref == invoice_ref or bool(_reference_tokens(payment_ref) & _reference_tokens(invoice_ref))
-
-
-def _invoice_limit(invoice: Mapping[str, Any]) -> int:
-    if "remaining_balance" in invoice:
-        return max(0, abs(int(invoice.get("remaining_balance", 0) or 0)))
-    return max(0, abs(_amount(invoice)) - abs(int(invoice.get("captured_amount", 0) or 0)))
-
-
-def _records(observation: Mapping[str, Any], name: str) -> list[dict[str, Any]]:
-    value = observation.get(name, [])
-    return [dict(item) for item in value] if isinstance(value, list) and all(isinstance(item, Mapping) for item in value) else []
-
-
-def _integrations(observation: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any]:
-    try:
-        from prepare import prepare
-        prepared = prepare(observation)
-        return _records(prepared, "payments"), _records(prepared, "invoices"), None
-    except (ImportError, TypeError, ValueError):
-        payments = _records(observation, "payments")
-        if not payments:
-            payments = _records(observation, "transactions")
-        return payments, _records(observation, "invoices"), None
-
-
-def _unique_payments(payments: Sequence[Mapping[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    unique: list[dict[str, Any]] = []
-    duplicate_map = dict(state.get("duplicate_map", {}))
-    for payment in payments:
-        item = dict(payment)
-        pid = _id(item, "payment_id", "id", "transaction_id", "event_id")
-        duplicate = _id(item, "duplicate_of", "duplicate_transaction_id", "original_payment_id")
-        key = duplicate or pid
-        if key and key in seen:
-            if pid:
-                duplicate_map[pid] = key
-            continue
-        if key:
-            seen.add(key)
-        unique.append(item)
-    state["duplicate_map"] = duplicate_map
-    return unique
-
-
-def _similar(left: str, right: str) -> float:
-    if not left or not right:
+def _sigmoid(value: float) -> float:
+    if value >= 35:
+        return 1.0
+    if value <= -35:
         return 0.0
-    return SequenceMatcher(None, left, right).ratio()
+    return 1.0 / (1.0 + math.exp(-value))
 
 
-def _candidate_score(payment: Mapping[str, Any], invoice: Mapping[str, Any]) -> float:
-    if not _valid_link(payment, invoice) or _amount(payment) <= 0 or _amount(invoice) <= 0:
-        return 0.0
-    score = 0.0
-    payment_amount = abs(_amount(payment))
-    invoice_amount = abs(int(invoice.get("remaining_balance", invoice.get("amount", 0)) or 0))
-    if payment_amount == invoice_amount:
-        score += 0.50
-    elif payment_amount <= invoice_amount and payment_amount >= invoice_amount * 0.5:
-        score += 0.30
-    else:
-        score += max(0.0, 0.20 - abs(payment_amount - invoice_amount) / max(payment_amount, invoice_amount) * 0.20)
-    score += 0.15
-    payment_ref = _reference(payment)
-    invoice_ref = _text(invoice, "invoice_reference", "reference", "invoice_number", "id", "invoice_id")
-    p_tokens, i_tokens = _reference_tokens(payment_ref), _reference_tokens(invoice_ref)
-    if payment_ref and invoice_ref and (payment_ref == invoice_ref or p_tokens & i_tokens):
-        score += 0.25
-    elif payment_ref and invoice_ref:
-        score += 0.10 * _similar(payment_ref, invoice_ref)
-    payer = _text(payment, "customer_name", "sender_name", "payer", "customer")
-    customer = _text(invoice, "customer_name", "customer", "customer_id")
-    payment_merchant = _merchant(payment)
-    invoice_merchant = _merchant(invoice)
-    if payment_merchant and invoice_merchant and payment_merchant == invoice_merchant:
-        score += 0.15
-    if payer and customer:
-        score += 0.08 * _similar(payer, customer)
-    status = str(invoice.get("status", "open") or "open").casefold()
-    if status in {"open", "unpaid", "partial", "issued"}:
-        score += 0.02
-    return min(1.0, round(score, 4))
+def _unique_by(items: list[Mapping[str, Any]], key: str) -> list[dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for item in items:
+        identifier = item.get(key)
+        if identifier is not None:
+            result.setdefault(str(identifier), dict(item))
+    return list(result.values())
 
 
-def _candidate_map(observation: Mapping[str, Any], payments: Sequence[Mapping[str, Any]], invoices: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    supplied = observation.get("candidates", observation.get("matches", {}))
-    by_id = {_id(invoice, "invoice_id", "id"): invoice for invoice in invoices}
-    result: dict[str, list[dict[str, Any]]] = {}
+def _payment_totals(observation: Mapping[str, Any]) -> dict[str, dict[str, int]]:
+    totals: dict[str, dict[str, int]] = {}
+    for transaction in _unique_by(list(observation.get("transactions", [])), "transaction_id"):
+        payment_id = str(transaction.get("payment_id", ""))
+        if not payment_id:
+            continue
+        row = totals.setdefault(payment_id, {"captured": 0, "refunded": 0, "fees": 0, "net": 0})
+        gross = int(transaction.get("gross", 0))
+        row["captured"] += max(0, gross)
+        row["refunded"] += max(0, -gross)
+        row["fees"] += int(transaction.get("fee", 0))
+        row["net"] += int(transaction.get("net", gross - int(transaction.get("fee", 0))))
+    return totals
+
+
+def _document_groups(documents: list[Mapping[str, Any]]) -> dict[tuple[str, str], Mapping[str, Any]]:
+    groups: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for document in documents:
+        key = (str(document.get("source", "")), str(document.get("lineage", document.get("document_id", ""))))
+        groups.setdefault(key, document)
+    return groups
+
+
+def _features(
+    payment: Mapping[str, Any],
+    invoice: Mapping[str, Any],
+    documents: list[Mapping[str, Any]],
+) -> list[int]:
+    groups = _document_groups(documents)
+
+    def source_digits(source: str, field: str, expected: Any) -> int:
+        expected_digits = _digits(expected)
+        return int(bool(expected_digits) and any(
+            item.get("source") == source and _digits(item.get(field)) == expected_digits
+            for item in groups.values()
+        ))
+
+    def source_text(source: str, field: str, expected: Any) -> int:
+        expected_text = _norm(expected)
+        return int(bool(expected_text) and any(
+            item.get("source") == source and _norm(item.get(field)) == expected_text
+            for item in groups.values()
+        ))
+
+    reference = invoice.get("reference")
+    tax_suffix = invoice.get("tax_suffix")
+    customer = invoice.get("customer_name")
+    return [
+        int(_digits(payment.get("source_ref")) == _digits(reference) and bool(_digits(reference))),
+        source_digits("processor_receipt", "reference", reference),
+        source_digits("bank_memo", "reference", reference),
+        source_digits("erp_advice", "reference", reference),
+        int(_norm(payment.get("tax_suffix")) == _norm(tax_suffix) and bool(_norm(tax_suffix))),
+        source_text("processor_receipt", "tax_suffix", tax_suffix),
+        source_text("bank_memo", "tax_suffix", tax_suffix),
+        source_text("erp_advice", "tax_suffix", tax_suffix),
+        int(_norm(payment.get("sender_name")) == _norm(customer) and bool(_norm(customer))),
+        source_text("processor_receipt", "sender_name", customer),
+        source_text("bank_memo", "sender_name", customer),
+        source_text("erp_advice", "sender_name", customer),
+        max(0, 5 - abs(int(payment.get("day", 0)) - int(invoice.get("issued_day", 0)))),
+        int(_norm(invoice.get("status")) == "open"),
+    ]
+
+
+def _candidate_matrix(
+    observation: Mapping[str, Any],
+    payments: list[Mapping[str, Any]],
+    invoices: list[Mapping[str, Any]],
+    totals: Mapping[str, Mapping[str, int]],
+) -> list[list[float]]:
+    matrix: list[list[float]] = []
     for payment in payments:
-        pid = _id(payment, "payment_id", "id", "transaction_id", "event_id")
-        raw = supplied.get(pid, []) if isinstance(supplied, Mapping) else []
-        options: list[dict[str, Any]] = []
-        if not raw:
-            raw = [{"invoice_id": _id(invoice, "invoice_id", "id"), "confidence": _candidate_score(payment, invoice)} for invoice in invoices]
-        for item in raw if isinstance(raw, list) else []:
-            candidate = {"invoice_id": item} if isinstance(item, str) else dict(item)
-            iid = _id(candidate, "invoice_id", "id")
-            if not iid or iid not in by_id:
+        payment_id = str(payment.get("payment_id", ""))
+        gross = int(totals.get(payment_id, {}).get("captured", 0))
+        documents = [
+            document for document in observation.get("remittance_documents", [])
+            if document.get("payment_id") == payment_id
+        ]
+        row: list[float] = []
+        for invoice in invoices:
+            compatible = (
+                _norm(payment.get("currency")) == _norm(invoice.get("currency"))
+                and payment.get("merchant") == invoice.get("merchant")
+                and gross == int(invoice.get("amount", 0))
+            )
+            if not compatible:
+                row.append(-1000.0)
                 continue
-            try:
-                confidence = float(candidate.get("confidence", candidate.get("score", 0.0)))
-            except (TypeError, ValueError):
-                confidence = 0.0
-            candidate["invoice_id"] = iid
-            candidate["confidence"] = max(0.0, min(1.0, confidence))
-            options.append(candidate)
-        result[pid] = sorted(options, key=lambda item: item["confidence"], reverse=True)
+            features = _features(payment, invoice, documents)
+            raw = MODEL_INTERCEPT + sum(
+                coefficient * feature
+                for coefficient, feature in zip(MODEL_COEFFICIENTS, features)
+            )
+            row.append(_sigmoid(raw))
+        matrix.append(row)
+    return matrix
+
+
+def _assignment(
+    payments: list[Mapping[str, Any]],
+    invoices: list[Mapping[str, Any]],
+    matrix: list[list[float]],
+    verified: Mapping[str, Any],
+) -> dict[str, str]:
+    payment_count = len(payments)
+    invoice_count = len(invoices)
+    used_invoices: set[str] = set()
+    result: dict[str, str] = {}
+    invoice_index = {str(invoice["invoice_id"]): index for index, invoice in enumerate(invoices)}
+
+    for payment in payments:
+        payment_id = str(payment["payment_id"])
+        invoice_id = verified.get(payment_id)
+        if invoice_id is None or invoice_id == "":
+            continue
+        column = invoice_index.get(str(invoice_id))
+        if column is not None and column not in used_invoices:
+            result[payment_id] = str(invoice_id)
+            used_invoices.add(column)
+
+    scores = [row[:] + [0.0] * payment_count for row in matrix]
+    for row_index, payment in enumerate(payments):
+        payment_id = str(payment["payment_id"])
+        if payment_id in verified:
+            scores[row_index] = [-1000.0] * (invoice_count + payment_count)
+            continue
+        for column in used_invoices:
+            scores[row_index][column] = -1000.0
+
+    if not payments or not invoices:
+        return result
+    if linear_sum_assignment is not None:
+        rows, columns = linear_sum_assignment(
+            [[-value for value in row] for row in scores]
+        )
+    else:
+        pairs = sorted(
+            (
+                (scores[row][column], row, column)
+                for row in range(payment_count)
+                for column in range(invoice_count)
+                if scores[row][column] > 0
+            ),
+            reverse=True,
+        )
+        chosen_rows: set[int] = set()
+        chosen_columns: set[int] = set(used_invoices)
+        rows, columns = [], []
+        for _, row, column in pairs:
+            if row not in chosen_rows and column not in chosen_columns:
+                chosen_rows.add(row)
+                chosen_columns.add(column)
+                rows.append(row)
+                columns.append(column)
+
+    for row, column in zip(rows, columns):
+        if column >= invoice_count or scores[row][column] < 0.5:
+            continue
+        payment_id = str(payments[row]["payment_id"])
+        if payment_id in verified or column in used_invoices:
+            continue
+        result[payment_id] = str(invoices[column]["invoice_id"])
+        used_invoices.add(column)
     return result
 
 
-def _valid_link(payment: Mapping[str, Any], invoice: Mapping[str, Any]) -> bool:
-    status = str(invoice.get("status", "") or "").casefold()
-    if invoice.get("cancelled") or status in {"cancelled", "canceled", "void", "voided"}:
-        return False
-    if _currency(payment) and _currency(invoice) and _currency(payment) != _currency(invoice):
-        return False
-    if _merchant(payment) and _merchant(invoice) and _merchant(payment) != _merchant(invoice):
-        return False
-    return True
+def _verified_results(observation: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
+    verified = dict(state.get("verified", {}))
+    for investigation in observation.get("investigations", []):
+        payment_id = investigation.get("payment_id")
+        if payment_id is not None:
+            verified[str(payment_id)] = investigation.get("verified_invoice_id")
+    return verified
 
 
-def _query_answer(observation: Mapping[str, Any], payment_id: str) -> tuple[bool, Any]:
-    answers = observation.get("query_results", observation.get("query_answer", {}))
-    return (True, answers[payment_id]) if isinstance(answers, Mapping) and payment_id in answers else (False, None)
-
-
-def _build_allocations(payments: Sequence[Mapping[str, Any]], invoices: Mapping[str, Mapping[str, Any]], candidates: Mapping[str, Sequence[Mapping[str, Any]]], state: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
-    allocations: list[dict[str, Any]] = []
-    unresolved: list[str] = []
-    captured = {str(k): int(v) for k, v in dict(state.get("captured", {})).items()}
-    processed = {str(k) for k in state.get("processed_payments", [])}
-    verified = state.get("query_results", {})
-    ranked = sorted(payments, key=lambda p: abs(_amount(p)), reverse=True)
-    for payment in ranked:
-        pid = _id(payment, "payment_id", "id", "transaction_id", "event_id")
-        if not pid or pid in processed or _amount(payment) <= 0:
+def _choose_query(
+    payments: list[Mapping[str, Any]],
+    matrix: list[list[float]],
+    verified: Mapping[str, Any],
+    queried: set[str],
+    totals: Mapping[str, Mapping[str, int]],
+) -> str | None:
+    choices: list[tuple[float, str]] = []
+    for row, payment in zip(matrix, payments):
+        payment_id = str(payment["payment_id"])
+        if payment_id in queried or payment_id in verified:
             continue
-        if str(payment.get("status", "")).casefold() in {"refund", "refunded", "cancelled", "canceled"}:
-            unresolved.append(pid)
-            continue
-        options = list(candidates.get(pid, ()))
-        if pid in verified:
-            answer = verified[pid]
-            options = [] if answer is None else [{"invoice_id": _id(answer, "invoice_id", "id") if isinstance(answer, Mapping) else str(answer), "confidence": 1.0}]
-        if not options:
-            unresolved.append(pid)
-            continue
-        chosen = options[0]
-        confidence = float(chosen.get("confidence", 0.0))
-        second = float(options[1].get("confidence", 0.0)) if len(options) > 1 else 0.0
-        threshold = AMBIGUOUS_THRESHOLD if payment.get("payer_family", payment.get("ambiguous_payer_family")) or confidence - second <= 0.15 else ACCEPT_THRESHOLD
-        iid = _id(chosen, "invoice_id", "id")
-        invoice = invoices.get(iid)
-        amount = abs(_amount(payment))
-        remaining = _invoice_limit(invoice) - captured.get(iid, 0) if invoice else 0
-        reference_threshold = 0.65 if _strong_reference(payment, invoice or {}) else threshold
-        if confidence < min(threshold, reference_threshold) or not invoice or not _valid_link(payment, invoice) or amount > remaining:
-            unresolved.append(pid)
-            continue
-        allocations.append({"payment_id": pid, "invoice_id": iid, "amount": amount})
-        captured[iid] = captured.get(iid, 0) + amount
-    return allocations, unresolved
+        values = sorted((value for value in row if value >= 0), reverse=True)
+        top = values[0] if values else 0.0
+        second = values[1] if len(values) > 1 else 0.0
+        gross = int(totals.get(payment_id, {}).get("captured", 0))
+        risk = gross * ((1.0 - top) + 0.75 * max(0.0, second - top + 0.2))
+        if risk > 0:
+            choices.append((risk, payment_id))
+    return max(choices)[1] if choices else None
 
 
-def _within_capacity(observation: Mapping[str, Any], unresolved: Sequence[str]) -> bool:
+def _posting(
+    observation: Mapping[str, Any],
+    matches: Mapping[str, str],
+) -> dict[str, Any]:
+    transactions = _unique_by(list(observation.get("transactions", [])), "transaction_id")
+    balances = {
+        str(invoice["invoice_id"]): {
+            "captured": 0, "refunded": 0, "fees": 0, "net": 0
+        }
+        for invoice in observation.get("invoices", [])
+    }
+    suspense = {"captured": 0, "refunded": 0, "fees": 0, "net": 0}
+    for transaction in transactions:
+        payment_id = str(transaction.get("payment_id", ""))
+        invoice_id = matches.get(payment_id)
+        target = balances.get(invoice_id, suspense)
+        gross = int(transaction.get("gross", 0))
+        fee = int(transaction.get("fee", 0))
+        target["captured"] += max(0, gross)
+        target["refunded"] += max(0, -gross)
+        target["fees"] += fee
+        target["net"] += int(transaction.get("net", gross - fee))
+
+    ledger = []
+    for invoice in observation.get("invoices", []):
+        invoice_id = str(invoice["invoice_id"])
+        balance = balances[invoice_id]
+        ledger.append({
+            "invoice_id": invoice_id,
+            **balance,
+            "remaining_due": int(invoice["amount"]) - balance["captured"] + balance["refunded"],
+        })
+    bank_total = sum(
+        int(credit.get("amount", 0))
+        for credit in _unique_by(list(observation.get("bank_credits", [])), "bank_id")
+    )
+    return {
+        "op": "submit",
+        "matches": [
+            {"payment_id": payment_id, "invoice_id": invoice_id}
+            for payment_id, invoice_id in matches.items()
+        ],
+        "ledger": ledger,
+        "suspense": suspense,
+        "bank_total": bank_total,
+    }
+
+
+def validate_posting(
+    observation: Mapping[str, Any],
+    payments: list[Mapping[str, Any]],
+    invoices: Mapping[str, Mapping[str, Any]],
+    allocations: list[Mapping[str, Any]],
+    unresolved: list[str],
+) -> bool:
+    """Compatibility validator for the repository's pre-v6 unit tests."""
     try:
-        return len(unresolved) <= int(observation.get("review_capacity", observation.get("capacity", observation.get("max_reviews", REVIEW_CAPACITY))))
+        capacity = int(observation.get("review_capacity", observation.get("capacity", 4)))
     except (TypeError, ValueError):
         return False
-
-
-def validate_posting(observation: Mapping[str, Any], payments: Sequence[Mapping[str, Any]], invoices: Mapping[str, Mapping[str, Any]], allocations: Sequence[Mapping[str, Any]], unresolved: Sequence[str]) -> bool:
-    if not _within_capacity(observation, unresolved):
+    if len(unresolved) > capacity:
         return False
-    payment_map = {_id(item, "payment_id", "id", "transaction_id", "event_id"): item for item in payments}
-    captured: dict[str, int] = {}
+    payment_map = {
+        str(item.get("payment_id", item.get("id", item.get("transaction_id", "")))): item
+        for item in payments
+    }
     used_payments: set[str] = set()
+    captured: dict[str, int] = {}
     for allocation in allocations:
-        pid, iid = str(allocation.get("payment_id", "")), str(allocation.get("invoice_id", ""))
-        payment, invoice = payment_map.get(pid), invoices.get(iid)
-        amount = _amount(allocation)
-        if not payment or not invoice or pid in used_payments or amount != abs(_amount(payment)) or amount <= 0:
+        payment_id = str(allocation.get("payment_id", ""))
+        invoice_id = str(allocation.get("invoice_id", ""))
+        payment = payment_map.get(payment_id)
+        invoice = invoices.get(invoice_id)
+        amount = int(allocation.get("amount", 0))
+        if not payment or not invoice or payment_id in used_payments or amount != abs(int(payment.get("amount", 0))):
             return False
-        if not _valid_link(payment, invoice):
+        if payment.get("currency") and invoice.get("currency") and _norm(payment["currency"]) != _norm(invoice["currency"]):
             return False
-        captured[iid] = captured.get(iid, 0) + amount
-        if captured[iid] > _invoice_limit(invoice):
+        if payment.get("merchant_id") and invoice.get("merchant_id") and payment["merchant_id"] != invoice["merchant_id"]:
             return False
-        used_payments.add(pid)
-    return True
+        if invoice.get("cancelled") or _norm(invoice.get("status")) in {"cancelled", "canceled", "void", "voided"}:
+            return False
+        captured[invoice_id] = captured.get(invoice_id, 0) + amount
+        if captured[invoice_id] > int(invoice.get("amount", 0)):
+            return False
+        used_payments.add(payment_id)
+    return len({str(item.get("invoice_id", "")) for item in allocations}) == len(allocations)
 
 
-def _safe_baseline(observation: Mapping[str, Any], state: Mapping[str, Any] | None) -> dict[str, Any]:
-    prior = dict(state or {})
-    payments = _records(observation, "payments") or _records(observation, "transactions")
-    pending = [_id(item, "payment_id", "id", "transaction_id", "event_id") for item in payments]
-    current = {"queries_used": min(MAX_QUERIES, int(prior.get("queries_used", 0) or 0)), "queried": list(prior.get("queried", []))[:MAX_QUERIES], "query_results": dict(prior.get("query_results", {})), "duplicate_map": dict(prior.get("duplicate_map", {})), "processed_payments": list(prior.get("processed_payments", [])), "captured": dict(prior.get("captured", {})), "pending": pending, "phase": "final"}
-    return {"action": {"type": "post", "allocations": [], "unresolved": pending}, "state": current}
+def decide(
+    observation: Mapping[str, Any],
+    state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if "transactions" not in observation and (
+        "candidates" in observation or "query_results" in observation
+    ):
+        legacy_state = dict(state or {})
+        legacy_state["queries_used"] = min(4, int(legacy_state.get("queries_used", 0) or 0))
+        legacy_state.setdefault("queried", [])
+        legacy_state.setdefault("query_results", {})
+        pending = [
+            str(item.get("payment_id", item.get("id", item.get("transaction_id", ""))))
+            for item in observation.get("payments", [])
+        ]
+        return {
+            "action": {"type": "post", "allocations": [], "unresolved": pending},
+            "state": legacy_state,
+        }
+    current = dict(state or {})
+    payments = [dict(item) for item in observation.get("payments", [])]
+    invoices = [dict(item) for item in observation.get("invoices", [])]
+    totals = _payment_totals(observation)
+    verified = _verified_results(observation, current)
+    queried = {str(item) for item in current.get("queried", [])}
+    matrix = _candidate_matrix(observation, payments, invoices, totals)
 
+    if len(queried) < MAX_QUERIES:
+        payment_id = _choose_query(payments, matrix, verified, queried, totals)
+        if payment_id is not None:
+            next_state = dict(current)
+            next_state["queried"] = sorted(queried | {payment_id})
+            next_state["verified"] = verified
+            next_state["queries_used"] = len(next_state["queried"])
+            next_state["phase"] = "awaiting_investigation"
+            return {
+                "action": {"op": "query", "payment_id": payment_id},
+                "state": next_state,
+            }
 
-def decide(observation: Mapping[str, Any], state: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    try:
-        current = dict(state or {})
-        current["queries_used"] = min(MAX_QUERIES, int(current.get("queries_used", 0) or 0))
-        current.setdefault("queried", [])
-        current.setdefault("query_results", {})
-        current.setdefault("duplicate_map", {})
-        current.setdefault("processed_payments", [])
-        current.setdefault("captured", {})
-        payments, invoice_list, _ = _integrations(observation)
-        payments = _unique_payments(payments, current)
-        invoices = {_id(item, "invoice_id", "id"): item for item in invoice_list if _id(item, "invoice_id", "id")}
-        candidates = _candidate_map(observation, payments, invoice_list)
-        for pid in list(current["queried"]):
-            if pid not in current["query_results"]:
-                found, answer = _query_answer(observation, pid)
-                if found:
-                    current["query_results"][pid] = answer
-        query_id = choose_query(payments, candidates, current)
-        if query_id is not None:
-            return {"action": {"type": "query", "payment_id": query_id}, "state": record_query(current, query_id)}
-        allocations, unresolved = _build_allocations(payments, invoices, candidates, current)
-        if not validate_posting(observation, payments, invoices, allocations, unresolved):
-            return _safe_baseline(observation, current)
-        captured = dict(current["captured"])
-        processed = list(current["processed_payments"])
-        for item in allocations:
-            captured[item["invoice_id"]] = int(captured.get(item["invoice_id"], 0)) + int(item["amount"])
-            processed.append(item["payment_id"])
-        current.update({"captured": captured, "processed_payments": sorted(set(processed)), "pending": list(unresolved), "phase": "final"})
-        result = {"action": {"type": "post", "allocations": allocations, "unresolved": unresolved}, "state": current}
-        json.dumps(result)
-        return result
-    except (TypeError, ValueError, KeyError, ImportError):
-        return _safe_baseline(observation, state)
+    matches = _assignment(payments, invoices, matrix, verified)
+    valid_matches: dict[str, str] = {}
+    invoice_by_id = {str(invoice["invoice_id"]): invoice for invoice in invoices}
+    for payment_id, invoice_id in matches.items():
+        invoice = invoice_by_id[invoice_id]
+        totals_for_payment = totals.get(payment_id, {})
+        captured = int(totals_for_payment.get("captured", 0))
+        refunded = int(totals_for_payment.get("refunded", 0))
+        if captured <= int(invoice["amount"]) and refunded <= captured and (
+            _norm(invoice.get("status")) != "cancelled" or captured == refunded
+        ):
+            valid_matches[payment_id] = invoice_id
+
+    next_state = dict(current)
+    next_state["verified"] = verified
+    next_state["queries_used"] = len(queried)
+    next_state["phase"] = "submitted"
+    next_state["matches"] = valid_matches
+    return {"action": _posting(observation, valid_matches), "state": next_state}
