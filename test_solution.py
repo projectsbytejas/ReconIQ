@@ -1,39 +1,49 @@
 import json
 import unittest
 
-from solution import decide, validate_posting
+from solution import decide
 
 
 class SolutionTests(unittest.TestCase):
-    def setUp(self):
-        self.payment = {"id": "p", "amount": 100, "currency": "USD", "merchant_id": "m"}
-        self.invoice = {"id": "i", "amount": 100, "currency": "USD", "merchant_id": "m"}
-        self.observation = {"payments": [self.payment], "invoices": [self.invoice]}
+    def _observation(self):
+        return {
+            "payments": [{"payment_id": "p", "merchant": "m", "currency": "INR"}],
+            "invoices": [{"invoice_id": "i", "merchant": "m", "currency": "INR", "amount": 100, "status": "open"}],
+            "transactions": [{"transaction_id": "t", "payment_id": "p", "gross": 100, "fee": 2, "net": 98}],
+            "bank_credits": [{"bank_id": "b", "payment_id": "p", "amount": 98}],
+            "investigations": [],
+            "queries_remaining": 4,
+        }
 
-    def test_validator_rejects_duplicate_invoice(self):
-        allocations = [{"payment_id": "p", "invoice_id": "i", "amount": 100},
-                       {"payment_id": "p2", "invoice_id": "i", "amount": 100}]
-        payments = [self.payment, {"id": "p2", "amount": 100}]
-        self.assertFalse(validate_posting(self.observation, payments, {"i": self.invoice}, allocations, []))
-
-    def test_validator_rejects_overcapture(self):
-        self.assertFalse(validate_posting(self.observation, [self.payment], {"i": {"id": "i", "amount": 50}}, [{"payment_id": "p", "invoice_id": "i", "amount": 100}], []))
-
-    def test_validator_rejects_cross_merchant_and_cancelled(self):
-        for invoice in ({"id": "i", "amount": 100, "merchant_id": "other"}, {"id": "i", "amount": 100, "cancelled": True}):
-            self.assertFalse(validate_posting(self.observation, [self.payment], {"i": invoice}, [{"payment_id": "p", "invoice_id": "i", "amount": 100}], []))
-
-    def test_query_cap_and_null_answer(self):
-        observation = {"payments": [{"id": "p", "amount": 1000}], "invoices": [{"id": "i1", "amount": 1000}, {"id": "i2", "amount": 1000}], "candidates": {"p": [{"invoice_id": "i1", "confidence": 0.5}, {"invoice_id": "i2", "confidence": 0.4}]}, "query_results": {"p": None}}
-        result = decide(observation, {"queries_used": 0, "queried": ["p"], "query_results": {}, "duplicate_map": {}, "pending": [], "phase": "awaiting_query"})
-        self.assertEqual(result["action"]["allocations"], [])
-        self.assertIn("p", result["action"]["unresolved"])
-        self.assertLessEqual(result["state"]["queries_used"], 4)
-
-    def test_state_round_trips(self):
-        observation = {"payments": [], "invoices": []}
-        result = decide(observation, {})
+    def test_submit_shape_and_state_round_trip(self):
+        result = decide(self._observation(), {})
+        self.assertEqual(set(result["action"]), {"op", "matches", "ledger", "suspense", "bank_total"})
         json.loads(json.dumps(result))
+
+    def test_null_result_leaves_payment_unresolved(self):
+        observation = self._observation()
+        observation["investigations"] = [{"payment_id": "p", "verified_invoice_id": None}]
+        result = decide(observation, {"queried": ["p"], "queries_used": 1})
+        self.assertEqual(result["action"]["matches"], [])
+        self.assertEqual(result["action"]["suspense"]["captured"], 100)
+
+    def test_duplicate_invoice_is_not_assigned(self):
+        observation = self._observation()
+        observation["payments"].append({"payment_id": "p2", "merchant": "m", "currency": "INR"})
+        observation["transactions"].append({"transaction_id": "t2", "payment_id": "p2", "gross": 50, "fee": 1, "net": 49})
+        observation["bank_credits"].append({"bank_id": "b2", "payment_id": "p2", "amount": 49})
+        observation["investigations"] = [
+            {"payment_id": "p", "verified_invoice_id": "i"},
+            {"payment_id": "p2", "verified_invoice_id": "i"},
+        ]
+        result = decide(observation, {"queried": ["p", "p2"], "queries_used": 2})
+        self.assertEqual(len(result["action"]["matches"]), 1)
+
+    def test_query_cap_and_no_repeat(self):
+        state = {"queried": ["p"], "queries_used": 1}
+        result = decide(self._observation(), state)
+        self.assertLessEqual(result["state"]["queries_used"], 4)
+        self.assertEqual(len(result["state"]["queried"]), len(set(result["state"]["queried"])))
 
 
 if __name__ == "__main__":

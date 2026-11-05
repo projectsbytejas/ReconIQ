@@ -1,9 +1,4 @@
-"""Evaluate solution.py against reconciliation JSON batches.
-
-The script accepts either a list of observations or an object containing a
-``batches`` list.  Expected truth may be supplied as ``expected_allocations``
-or ``truth`` on each batch.
-"""
+"""Run the public v6 lifecycle and print per-batch scores."""
 
 from __future__ import annotations
 
@@ -11,90 +6,83 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
 
-def _load_solution(path: Path) -> Any:
+def _load(path: Path):
     spec = importlib.util.spec_from_file_location("submitted_solution", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-def _batches(path: Path) -> list[dict[str, Any]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(data, dict):
-        data = data.get("batches", data.get("examples", [data]))
-    return [dict(item) for item in data]
+def _expected(obs, mapping):
+    fields = ("captured", "refunded", "fees", "net")
+    balances = {i["invoice_id"]: dict.fromkeys(fields, 0) for i in obs["invoices"]}
+    suspense = dict.fromkeys(fields, 0)
+    unique = {t["transaction_id"]: t for t in obs["transactions"]}.values()
+    for transaction in unique:
+        row = balances[mapping[transaction["payment_id"]]] if transaction["payment_id"] in mapping else suspense
+        row["captured"] += max(0, transaction["gross"])
+        row["refunded"] += max(0, -transaction["gross"])
+        row["fees"] += transaction["fee"]
+        row["net"] += transaction["net"]
+    ledger = [
+        {**{"invoice_id": i["invoice_id"]}, **balances[i["invoice_id"]],
+         "remaining_due": i["amount"] - balances[i["invoice_id"]]["captured"] + balances[i["invoice_id"]]["refunded"]}
+        for i in obs["invoices"]
+    ]
+    return {
+        "op": "submit",
+        "matches": [{"payment_id": p, "invoice_id": i} for p, i in mapping.items()],
+        "ledger": ledger,
+        "suspense": suspense,
+        "bank_total": sum(b["amount"] for b in {b["bank_id"]: b for b in obs["bank_credits"]}.values()),
+    }
 
 
-def _truth(batch: dict[str, Any]) -> dict[str, str]:
-    raw = batch.get("expected_allocations", batch.get("truth", {}))
-    if isinstance(raw, dict):
-        return {str(k): str(v) for k, v in raw.items()}
-    result: dict[str, str] = {}
-    for item in raw if isinstance(raw, list) else []:
-        if isinstance(item, dict):
-            pid = item.get("payment_id", item.get("payment"))
-            iid = item.get("invoice_id", item.get("invoice"))
-            if pid is not None and iid is not None:
-                result[str(pid)] = str(iid)
-    return result
-
-
-def evaluate(solution_path: Path, dataset_path: Path) -> tuple[float, int, list[str]]:
-    solution = _load_solution(solution_path)
-    scores: list[float] = []
-    queries = 0
-    violations: list[str] = []
-    for index, batch in enumerate(_batches(dataset_path), 1):
-        observation = batch.get("observation", batch)
-        result = solution.decide(observation, {})
-        action = result.get("action", {})
-        state = result.get("state", {})
-        queries += int(state.get("queries_used", 0))
-        if len(state.get("queried", [])) != len(set(state.get("queried", []))) or queries > 4 * index:
-            violations.append(f"batch {index}: query cap or repeat")
-        truth = _truth(batch)
-        payments = {
-            str(item.get("payment_id", item.get("id", item.get("transaction_id")))): item
-            for item in observation.get("payments", observation.get("transactions", []))
-        }
-        value = sum(abs(int(item.get("amount", item.get("gross", 0)) or 0)) for item in payments.values())
-        wrong = 0
-        unresolved = 0
-        assigned: dict[str, str] = {}
-        for item in action.get("allocations", []):
-            pid, iid = str(item.get("payment_id")), str(item.get("invoice_id"))
-            assigned[pid] = iid
-            if truth and truth.get(pid) != iid:
-                wrong += abs(int(payments.get(pid, {}).get("amount", 0) or 0))
-        if truth:
-            unresolved = sum(
-                abs(int(payments.get(pid, {}).get("amount", 0) or 0))
-                for pid in truth
-                if pid not in assigned
-            )
-        score = max(0.0, 100 * (1 - (unresolved + 4 * wrong + 180 * int(state.get("queries_used", 0))) / value)) if value else 100.0
-        scores.append(score)
-    average = sum(scores) / len(scores) if scores else 0.0
-    return average, queries, violations
-
-
-def main() -> int:
-    if len(sys.argv) < 3:
-        print("usage: python evaluate.py solution.py dataset.json")
-        return 2
-    average, queries, violations = evaluate(Path(sys.argv[1]), Path(sys.argv[2]))
-    print(f"average score: {average:.2f}")
-    print(f"queries used: {queries}")
-    print(f"integrity violations: {len(violations)}")
-    for violation in violations:
-        print(violation)
-    return 1 if violations else 0
+def evaluate(solution_path: Path, dataset_path: Path) -> tuple[float, list[dict]]:
+    module = _load(solution_path)
+    rows = json.loads(dataset_path.read_text(encoding="utf-8"))
+    reports = []
+    for index, item in enumerate(rows):
+        obs = item["observation"]
+        truth = item["matches"]
+        state = {}
+        queries = []
+        violation = ""
+        for _ in range(5):
+            response = module.decide(obs, state)
+            action, state = response["action"], response["state"]
+            if action["op"] == "query":
+                pid = action["payment_id"]
+                if pid in queries or len(queries) >= 4:
+                    violation = "query cap/repeat"
+                    break
+                queries.append(pid)
+                obs["queries_remaining"] -= 1
+                obs["investigations"].append({"payment_id": pid, "verified_invoice_id": truth[pid]})
+                continue
+            mapping = {m["payment_id"]: m["invoice_id"] for m in action["matches"]}
+            expected = _expected(obs, mapping)
+            if action != expected:
+                violation = "posting differs from unique source totals"
+            break
+        else:
+            violation = "no final submission"
+        values = {p: sum(max(0, t["gross"]) for t in {x["transaction_id"]: x for x in obs["transactions"]}.values() if t["payment_id"] == p) for p in truth}
+        eligible = sum(values[p] for p, i in truth.items() if i is not None)
+        correct = sum(values[p] for p, i in truth.items() if i is not None and dict((m["payment_id"], m["invoice_id"]) for m in action.get("matches", [])).get(p) == i)
+        wrong = 4 * sum(values[p] for p, i in dict((m["payment_id"], m["invoice_id"]) for m in action.get("matches", [])).items() if truth.get(p) != i)
+        unresolved = eligible - correct
+        score = max(0.0, 100 * (1 - (unresolved + wrong + 180 * len(queries)) / eligible)) if eligible else 100.0
+        reports.append({"batch": index, "score": round(score, 4), "queries": len(queries), "violation": violation})
+        print(json.dumps(reports[-1]))
+    return (sum(r["score"] for r in reports) / len(reports) if reports else 0.0), reports
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: python evaluate.py solution.py dataset.json")
+    average, reports = evaluate(Path(sys.argv[1]), Path(sys.argv[2]))
+    print(json.dumps({"average": round(average, 4), "queries": sum(r["queries"] for r in reports), "violations": sum(bool(r["violation"]) for r in reports)}))
