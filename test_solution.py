@@ -1,40 +1,57 @@
-import json
-import unittest
+import copy, json, os, sys
+sys.path.insert(0, os.path.dirname(__file__))
+import solution as S
 
-from solution import decide, validate_posting
+def obs():
+    return {
+        "invoices": [
+            {"invoice_id": "inv_a", "merchant": "m1", "currency": "INR", "customer_name": "A", "tax_suffix": "1111",
+             "reference": "INV-1000001", "issued_day": 1, "amount": 1000, "status": "open"},
+            {"invoice_id": "inv_b", "merchant": "m1", "currency": "INR", "customer_name": "B", "tax_suffix": "2222",
+             "reference": "INV-1000002", "issued_day": 1, "amount": 500, "status": "cancelled"}],
+        "payments": [
+            {"payment_id": "pay_1", "merchant": "m1", "currency": " inr ", "channel": "wallet", "sender_name": "A",
+             "tax_suffix": "1111", "source_ref": "INV-1000001", "day": 2}],
+        "transactions": [
+            {"event_id": "e1", "transaction_id": "t1", "payment_id": "pay_1", "kind": "capture", "gross": 1000, "fee": 20, "net": 980, "parent_transaction_id": None},
+            {"event_id": "e2", "transaction_id": "t1", "payment_id": "pay_1", "kind": "capture", "gross": 1000, "fee": 20, "net": 980, "parent_transaction_id": None}],
+        "bank_credits": [{"bank_id": "b1", "payment_id": "pay_1", "amount": 980}, {"bank_id": "b1", "payment_id": "pay_1", "amount": 980}],
+        "remittance_documents": [], "investigations": [], "queries_remaining": 4}
 
+def test_contract_and_dedup():
+    r = S.decide(obs(), {})
+    assert set(r) == {"action", "state"}
+    a = r["action"]
+    assert a["op"] == "submit" and set(a) == {"op", "matches", "ledger", "suspense", "bank_total"}
+    assert a["bank_total"] == 980 and len(a["ledger"]) == 2
+    assert a["matches"] == [{"payment_id": "pay_1", "invoice_id": "inv_a"}]
+    assert a["ledger"][0]["remaining_due"] == 0 and a["ledger"][1]["remaining_due"] == 500
 
-class SolutionTests(unittest.TestCase):
-    def setUp(self):
-        self.payment = {"id": "p", "amount": 100, "currency": "USD", "merchant_id": "m"}
-        self.invoice = {"id": "i", "amount": 100, "currency": "USD", "merchant_id": "m"}
-        self.observation = {"payments": [self.payment], "invoices": [self.invoice]}
+def test_cancelled_needs_full_reversal():
+    o = obs()
+    assert not S.eligible(o["payments"][0], {"captured": 500, "refunded": 0}, o["invoices"][1])
+    assert S.eligible(o["payments"][0], {"captured": 500, "refunded": 500}, o["invoices"][1])
 
-    def test_validator_rejects_duplicate_invoice(self):
-        allocations = [{"payment_id": "p", "invoice_id": "i", "amount": 100},
-                       {"payment_id": "p2", "invoice_id": "i", "amount": 100}]
-        payments = [self.payment, {"id": "p2", "amount": 100}]
-        self.assertFalse(validate_posting(self.observation, payments, {"i": self.invoice}, allocations, []))
+def test_reference_and_currency_normalisation():
+    assert S.norm_ref(" inv / 6608957 ") == "6608957" and S.norm_ref("INV-6608957") == "6608957"
+    assert S.norm_currency(" inr ") == "INR"
 
-    def test_validator_rejects_overcapture(self):
-        self.assertFalse(validate_posting(self.observation, [self.payment], {"i": {"id": "i", "amount": 50}}, [{"payment_id": "p", "invoice_id": "i", "amount": 100}], []))
+def test_verified_null_is_suspense():
+    o = obs(); o["investigations"] = [{"payment_id": "pay_1", "verified_invoice_id": None}]; o["queries_remaining"] = 3
+    a = S.decide(o, {})["action"]
+    assert a["matches"] == [] and a["suspense"]["net"] == 980
 
-    def test_validator_rejects_cross_merchant_and_cancelled(self):
-        for invoice in ({"id": "i", "amount": 100, "merchant_id": "other"}, {"id": "i", "amount": 100, "cancelled": True}):
-            self.assertFalse(validate_posting(self.observation, [self.payment], {"i": invoice}, [{"payment_id": "p", "invoice_id": "i", "amount": 100}], []))
+def test_verified_invoice_locked():
+    o = obs(); o["investigations"] = [{"payment_id": "pay_1", "verified_invoice_id": "inv_a"}]
+    assert S.decide(o, {})["action"]["matches"][0]["invoice_id"] == "inv_a"
 
-    def test_query_cap_and_null_answer(self):
-        observation = {"payments": [{"id": "p", "amount": 1000}], "invoices": [{"id": "i1", "amount": 1000}, {"id": "i2", "amount": 1000}], "candidates": {"p": [{"invoice_id": "i1", "confidence": 0.5}, {"invoice_id": "i2", "confidence": 0.4}]}, "query_results": {"p": None}}
-        result = decide(observation, {"queries_used": 0, "queried": ["p"], "query_results": {}, "duplicate_map": {}, "pending": [], "phase": "awaiting_query"})
-        self.assertEqual(result["action"]["allocations"], [])
-        self.assertIn("p", result["action"]["unresolved"])
-        self.assertLessEqual(result["state"]["queries_used"], 4)
+def test_failsafe_shape():
+    o = obs(); del o["payments"][0]["merchant"]
+    a = S.decide(o, {})["action"]
+    assert a["op"] == "submit" and a["matches"] == []
 
-    def test_state_round_trips(self):
-        observation = {"payments": [], "invoices": []}
-        result = decide(observation, {})
-        json.loads(json.dumps(result))
-
-
-if __name__ == "__main__":
-    unittest.main()
+def test_integer_money_only():
+    import pytest
+    for bad in (True, 1.0):
+        with pytest.raises(ValueError):
+            S._int(bad)

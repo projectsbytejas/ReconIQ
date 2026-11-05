@@ -8,7 +8,7 @@ def load_batch(observation):
 
     bank_credits = []
 
-    for credit in observation["bank_credits"]:
+    for credit in observation.get("bank_credits", []):
 
         bank = BankCredit(
             bank_id=credit["bank_id"],
@@ -18,4 +18,10 @@ def load_batch(observation):
 
         bank_credits.append(bank)
 
-    return Batch(bank_credits=bank_credits)
+    return Batch(
+        invoices=list(observation.get("invoices", [])),
+        payments=list(observation.get("payments", observation.get("transactions", []))),
+        bank_credits=bank_credits,
+        refunds=list(observation.get("refunds", [])),
+        raw=dict(observation),
+    )

@@ -1,8 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
-
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 @dataclass
 class Invoice:
@@ -42,8 +39,8 @@ class Refund:
 
 @dataclass
 class Batch:
-    invoices: list[Invoice]
-    payments: list[Payment]
-    bank_credits: list[BankCredit]
-    refunds: list[Refund]
-    raw: dict
+    invoices: list[Invoice] = field(default_factory=list)
+    payments: list[Payment] = field(default_factory=list)
+    bank_credits: list[BankCredit] = field(default_factory=list)
+    refunds: list[Refund] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)

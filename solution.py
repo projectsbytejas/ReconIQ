@@ -1,322 +1,421 @@
-"""Integration decision function for payment reconciliation.
+"""ReconIQ - payment-to-invoice reconciliation for the hackathon contract.
 
-Teammate parser/rule/matcher modules are optional.  When they are added, expose
-the functions documented in ``interfaces.md`` and update the three imports in
-``_integrations``; the safety validator remains the final authority.
+Entry point: decide(observation, state) -> {"action": ..., "state": ...}
+
+Standard library only, deterministic, no machine learning.  Pipeline:
+  1. normalise + deduplicate (transactions by transaction_id, bank credits by bank_id)
+  2. build payment groups from unique transactions (integer minor units)
+  3. generate candidates under hard accounting constraints
+  4. score candidates with explicit, independent-origin evidence
+  5. resolve one-to-one assignment globally (exact enumeration per component)
+  6. spend the query budget where a verified answer is worth more than its cost
+  7. emit the exact submit schema (full ledger + suspense + bank_total)
 """
+import itertools
+import math
+import re
 
-from __future__ import annotations
+QUERY_COST = 180
+WRONG_MULT = 4
+MAX_QUERIES = 4
 
-import json
-from typing import Any, Mapping, Sequence
+# ---------------------------------------------------------------- weights --
+# Log-odds contributions.  They were set by hand (rounded) after tabulating how
+# each evidence pattern behaves on the supplied training scenarios.
+GAP_OK = range(0, 4)           # payment day - invoice issued day seen for true links
+W_GAP_OUTSIDE = -4.0           # soft only: schema says date is never a hard cutoff
+W_UNDERPAID = -3.0             # captured < invoice amount (training truth is exact)
+# Origin A = raw payment + processor receipt + copied lineage (ONE vote):
+W_A = {                        # (reference state, tax suffix matches)
+    ("match", True): 4.3, ("match", False): -0.3,
+    ("none", True): 3.0, ("none", False): -2.8,
+    ("other", True): 1.8, ("other", False): -3.3,
+}
+W_A_NAME = (0.2, -0.5)         # payment sender name (match, mismatch): weak
+# Independent remittance lineages (active, not the processor receipt):
+W_DOC_MATCH = 1.5
+W_DOC_OTHER = -0.5
+W_DOC_NAME_BAD = -4.0          # document names the payer; invoice customer differs
+W_DOC_NAME_OK = 0.3
+W_DOC_NAME_CAP = -6.0
+NULL_LOGIT = 0.0               # score of "this payment matches nothing"
+# A payment whose tax suffix matches no eligible invoice is (in all supplied
+# data) never a real match; one whose suffix matches some candidate usually is.
+W_NULL_TAX_UNMATCHED = 3.5
+W_NULL_TAX_MATCHED = -2.0
+TEMPERATURE = 1.35              # >1 flattens posteriors (evidence is correlated)
+PRUNE_MARGIN = 9.0             # drop candidates this far below the payment's best
 
-from query import MAX_QUERIES, choose_query, record_query
 
-ACCEPT_THRESHOLD = 0.85
-AMBIGUOUS_THRESHOLD = 0.92
-REVIEW_CAPACITY = 4
-
-
-def _id(record: Mapping[str, Any], *names: str) -> str:
-    for name in names:
-        value = record.get(name)
-        if value is not None and value != "":
-            return str(value)
-    return ""
+# ------------------------------------------------------------ normalisation --
+def _int(v):
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError("money must be int")
+    return v
 
 
-def _amount(record: Mapping[str, Any]) -> int:
-    for name in ("amount", "gross", "value", "minor_units"):
-        try:
-            return abs(int(record.get(name, 0)))
-        except (TypeError, ValueError):
+def norm_currency(c):
+    return str(c).strip().upper() if c is not None else ""
+
+
+def norm_ref(r):
+    """INV followed by seven digits -> canonical digits; otherwise None."""
+    if r is None:
+        return None
+    s = re.sub(r"[^A-Za-z0-9]", "", str(r)).upper()
+    m = re.fullmatch(r"INV(\d{7})", s)
+    return m.group(1) if m else None
+
+
+def norm_tax(t):
+    return None if t is None else str(t).strip()
+
+
+def norm_name(n):
+    return None if n is None else " ".join(str(n).split()).casefold()
+
+
+def unique_transactions(obs):
+    seen = {}
+    for t in obs.get("transactions", []):
+        tid = t["transaction_id"]
+        if tid not in seen:
+            seen[tid] = t
+    return list(seen.values())
+
+
+def unique_bank_credits(obs):
+    seen = {}
+    for b in obs.get("bank_credits", []):
+        if b["bank_id"] not in seen:
+            seen[b["bank_id"]] = b
+    return list(seen.values())
+
+
+def payment_groups(obs):
+    groups = {}
+    for p in obs["payments"]:
+        groups[p["payment_id"]] = dict(captured=0, refunded=0, fees=0, net=0)
+    for t in unique_transactions(obs):
+        g = groups.setdefault(t["payment_id"], dict(captured=0, refunded=0, fees=0, net=0))
+        gross = _int(t["gross"])
+        g["captured"] += max(gross, 0)
+        g["refunded"] += max(-gross, 0)
+        g["fees"] += _int(t["fee"])
+        g["net"] += _int(t["net"])
+    return groups
+
+
+# ----------------------------------------------------------------- evidence --
+def independent_documents(docs):
+    """Active, non-receipt documents, one per lineage (copies are not votes)."""
+    by_lineage = {}
+    for d in sorted(docs, key=lambda d: (d.get("received_day", 0), str(d.get("document_id")))):
+        if d.get("status") != "active" or d.get("source") == "processor_receipt":
             continue
-    return 0
+        by_lineage.setdefault(d.get("lineage") or d.get("document_id"), d)
+    return list(by_lineage.values())
 
 
-def _currency(record: Mapping[str, Any]) -> str:
-    return str(record.get("currency", record.get("currency_code", ""))).upper()
+def origin_reference(payment, docs):
+    """Reference of the raw-payment origin (source_ref, else its receipt copy)."""
+    ref = norm_ref(payment.get("source_ref"))
+    if ref is not None:
+        return ref
+    for d in docs:
+        if d.get("source") == "processor_receipt" and d.get("status") == "active":
+            ref = norm_ref(d.get("reference"))
+            if ref is not None:
+                return ref
+    return None
 
 
-def _merchant(record: Mapping[str, Any]) -> str:
-    return str(record.get("merchant_id", record.get("merchant", "")))
-
-
-def _records(observation: Mapping[str, Any], name: str) -> list[dict[str, Any]]:
-    value = observation.get(name, [])
-    return [dict(item) for item in value] if isinstance(value, list) else []
-
-
-def _integrations(
-    observation: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any]:
-    """Use teammate modules when present, otherwise use explicit TODO stubs."""
-    # TODO(teammate-1/2): replace these optional imports with landed modules.
-    parser = None
-    rule_engine = None
-    matcher = None
-    try:
-        from prepare import prepare as parser # type: ignore
-    except ImportError:
-        pass
-    try:
-        from rules import score_candidates as rule_engine  # type: ignore
-    except ImportError:
-        pass
-    try:
-        from matcher import match_payment as matcher  # type: ignore
-    except ImportError:
-        pass
-    if parser is not None:
-        payments, invoices = parser(observation)
-        return [dict(item) for item in payments], [dict(item) for item in invoices], matcher
-    return (
-        _records(observation, "payments") or _records(observation, "transactions"),
-        _records(observation, "invoices"),
-        matcher,
-    )
-
-
-def _unique_payments(
-    payments: Sequence[Mapping[str, Any]], state: dict[str, Any]
-) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    unique: list[dict[str, Any]] = []
-    duplicate_map = dict(state.get("duplicate_map", {}))
-    for payment in payments:
-        payment_id = _id(payment, "payment_id", "id", "transaction_id")
-        duplicate_of = _id(payment, "duplicate_of", "duplicate_transaction_id")
-        key = duplicate_of or payment_id
-        if key and key in seen:
-            if payment_id:
-                duplicate_map[payment_id] = key
-            continue
-        if key:
-            seen.add(key)
-        unique.append(dict(payment))
-    state["duplicate_map"] = duplicate_map
-    return unique
-
-
-def _candidate_map(
-    observation: Mapping[str, Any],
-    payments: Sequence[Mapping[str, Any]],
-    invoices: Sequence[Mapping[str, Any]],
-    matcher: Any = None,
-) -> dict[str, list[dict[str, Any]]]:
-    supplied = observation.get("candidates", observation.get("matches", {}))
-    by_id = {_id(invoice, "invoice_id", "id"): invoice for invoice in invoices}
-    result: dict[str, list[dict[str, Any]]] = {}
-    for payment in payments:
-        pid = _id(payment, "payment_id", "id", "transaction_id")
-        raw = supplied.get(pid, []) if isinstance(supplied, dict) else []
-        if not raw and matcher is not None:
-            raw = matcher(payment, invoices)
-        if not raw:
-            raw = payment.get("candidates", [])
-        options: list[dict[str, Any]] = []
-        for item in raw if isinstance(raw, list) else []:
-            candidate = {"invoice_id": item} if isinstance(item, str) else dict(item)
-            iid = _id(candidate, "invoice_id", "id")
-            candidate["invoice_id"] = iid
-            candidate["invoice"] = by_id.get(iid, candidate.get("invoice", {}))
-            try:
-                candidate["confidence"] = max(
-                    0.0, min(1.0, float(candidate.get("confidence", candidate.get("score", 0.0))))
-                )
-            except (TypeError, ValueError):
-                candidate["confidence"] = 0.0
-            if iid:
-                options.append(candidate)
-        result[pid] = sorted(options, key=lambda item: item["confidence"], reverse=True)
-    return result
-
-
-def _query_answer(observation: Mapping[str, Any], payment_id: str) -> tuple[bool, Any]:
-    answers = observation.get("query_results", observation.get("query_answer", {}))
-    if isinstance(answers, dict) and payment_id in answers:
-        return True, answers[payment_id]
-    return False, None
-
-
-def _valid_link(payment: Mapping[str, Any], invoice: Mapping[str, Any]) -> bool:
-    if invoice.get("cancelled", invoice.get("status") == "cancelled"):
+def eligible(pay, grp, inv):
+    """Hard constraints (merchant, currency, accounting, cancelled rule)."""
+    if pay["merchant"] != inv["merchant"]:
         return False
-    return not (
-        _currency(payment)
-        and _currency(invoice)
-        and _currency(payment) != _currency(invoice)
-    ) and not (
-        _merchant(payment)
-        and _merchant(invoice)
-        and _merchant(payment) != _merchant(invoice)
-    )
-
-
-def _build_allocations(
-    payments: Sequence[Mapping[str, Any]],
-    invoices: Mapping[str, Mapping[str, Any]],
-    candidates: Mapping[str, Sequence[Mapping[str, Any]]],
-    state: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    allocations: list[dict[str, Any]] = []
-    unresolved: list[str] = []
-    used: set[str] = set()
-    captured: dict[str, int] = {}
-    verified = state.get("query_results", {})
-    for payment in payments:
-        pid = _id(payment, "payment_id", "id", "transaction_id")
-        if pid in verified:
-            chosen = verified[pid]
-            if chosen is None:
-                unresolved.append(pid)
-                continue
-            iid = _id(chosen if isinstance(chosen, dict) else {"id": chosen}, "invoice_id", "id")
-        else:
-            options = list(candidates.get(pid, ()))
-            if not options:
-                unresolved.append(pid)
-                continue
-            chosen = options[0]
-            confidence = float(chosen.get("confidence", 0.0))
-            second = float(options[1].get("confidence", 0.0)) if len(options) > 1 else 0.0
-            family = bool(payment.get("payer_family", payment.get("ambiguous_payer_family", False)))
-            threshold = AMBIGUOUS_THRESHOLD if family or confidence - second <= 0.15 else ACCEPT_THRESHOLD
-            iid = _id(chosen, "invoice_id", "id")
-            if confidence < threshold:
-                unresolved.append(pid)
-                continue
-        invoice = invoices.get(iid)
-        amount = _amount(payment)
-        if (
-            not iid
-            or invoice is None
-            or iid in used
-            or not _valid_link(payment, invoice)
-            or captured.get(iid, 0) + amount > _amount(invoice)
-        ):
-            unresolved.append(pid)
-            continue
-        used.add(iid)
-        captured[iid] = captured.get(iid, 0) + amount
-        allocations.append({"payment_id": pid, "invoice_id": iid, "amount": amount})
-    return allocations, unresolved
-
-
-def _within_capacity(observation: Mapping[str, Any], unresolved: Sequence[str]) -> bool:
-    capacity = observation.get(
-        "review_capacity",
-        observation.get("capacity", observation.get("max_reviews", REVIEW_CAPACITY)),
-    )
-    try:
-        return len(unresolved) <= int(capacity)
-    except (TypeError, ValueError):
+    if norm_currency(pay["currency"]) != norm_currency(inv["currency"]):
         return False
-
-
-def validate_posting(
-    observation: Mapping[str, Any],
-    payments: Sequence[Mapping[str, Any]],
-    invoices: Mapping[str, Mapping[str, Any]],
-    allocations: Sequence[Mapping[str, Any]],
-    unresolved: Sequence[str],
-) -> bool:
-    """Final hard safety filter; unresolved payments are always safe."""
-    if not _within_capacity(observation, unresolved):
+    if grp["captured"] <= 0 or grp["captured"] > inv["amount"]:
         return False
-    seen: set[str] = set()
-    captured: dict[str, int] = {}
-    payment_map = {_id(item, "payment_id", "id", "transaction_id"): item for item in payments}
-    for allocation in allocations:
-        pid = str(allocation.get("payment_id", ""))
-        iid = str(allocation.get("invoice_id", ""))
-        payment = payment_map.get(pid)
-        invoice = invoices.get(iid)
-        amount = _amount(allocation)
-        if not payment or not invoice or iid in seen or amount != _amount(payment):
-            return False
-        if not _valid_link(payment, invoice):
-            return False
-        captured[iid] = captured.get(iid, 0) + amount
-        if captured[iid] > _amount(invoice):
-            return False
-        seen.add(iid)
+    if grp["refunded"] > grp["captured"]:
+        return False
+    if inv["status"] == "cancelled" and grp["captured"] != grp["refunded"]:
+        return False
     return True
 
 
-def _safe_baseline(
-    observation: Mapping[str, Any],
-    state: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    current = {
-        "queries_used": min(MAX_QUERIES, int((state or {}).get("queries_used", 0) or 0)),
-        "queried": list((state or {}).get("queried", []))[:MAX_QUERIES],
-        "query_results": dict((state or {}).get("query_results", {})),
-        "duplicate_map": dict((state or {}).get("duplicate_map", {})),
-        "pending": [],
-        "phase": "final",
-    }
-    payments = _records(observation, "payments") or _records(observation, "transactions")
-    current["pending"] = [_id(item, "payment_id", "id", "transaction_id") for item in payments]
-    return {"action": {"type": "post", "allocations": [], "unresolved": current["pending"]}, "state": current}
+def score(pay, grp, inv, docs):
+    s = 0.0
+    if grp["captured"] < inv["amount"]:
+        s += W_UNDERPAID
+    gap = pay["day"] - inv["issued_day"]
+    if gap not in GAP_OK:
+        s += W_GAP_OUTSIDE
+    ref = origin_reference(pay, docs)
+    inv_ref = norm_ref(inv["reference"])
+    state = "none" if ref is None else ("match" if ref == inv_ref else "other")
+    tax_ok = norm_tax(pay.get("tax_suffix")) == norm_tax(inv["tax_suffix"])
+    s += W_A[(state, tax_ok)]
+    s += W_A_NAME[0] if norm_name(pay.get("sender_name")) == norm_name(inv["customer_name"]) else W_A_NAME[1]
+    bad_names = 0.0
+    for d in independent_documents(docs):
+        dref = norm_ref(d.get("reference"))
+        if dref is not None:
+            s += W_DOC_MATCH if dref == inv_ref else W_DOC_OTHER
+        dn = norm_name(d.get("sender_name"))
+        if dn is not None:
+            if dn == norm_name(inv["customer_name"]):
+                s += W_DOC_NAME_OK
+            else:
+                bad_names += W_DOC_NAME_BAD
+    s += max(bad_names, W_DOC_NAME_CAP)
+    return s
 
 
-def decide(
-    observation: Mapping[str, Any], state: Mapping[str, Any] | None = None
-) -> dict[str, Any]:
-    """Return one query action or a validated final posting."""
-    try:
-        current = dict(state or {})
-        current.setdefault("queries_used", 0)
-        current.setdefault("queried", [])
-        current.setdefault("query_results", {})
-        current.setdefault("duplicate_map", {})
-        current.setdefault("pending", [])
-        current["queries_used"] = min(MAX_QUERIES, int(current["queries_used"]))
-        payments, invoice_list, matcher = _integrations(observation)
-        payments = _unique_payments(payments, current)
-        invoices = {_id(item, "invoice_id", "id"): item for item in invoice_list}
-        candidates = _candidate_map(observation, payments, invoice_list, matcher)
-        for pid in list(current["queried"]):
-            if pid not in current["query_results"]:
-                found, answer = _query_answer(observation, pid)
-                if found:
-                    current["query_results"][pid] = answer
-        query_id = choose_query(payments, candidates, current)
-        if query_id is not None:
-            return {"action": {"type": "query", "payment_id": query_id}, "state": record_query(current, query_id)}
-        allocations, unresolved = _build_allocations(payments, invoices, candidates, current)
-        if not validate_posting(observation, payments, invoices, allocations, unresolved):
-            return _safe_baseline(observation, current)
-        current["pending"] = list(unresolved)
-        current["phase"] = "final"
-        result = {
-            "action": {"type": "post", "allocations": allocations, "unresolved": unresolved},
-            "state": current,
-        }
-        json.dumps(result)
-        return result
-    except Exception:
-        return _safe_baseline(observation, state)
+# ---------------------------------------------------------------- inference --
+def components(cands):
+    """Connected components of payments that share candidate invoices."""
+    pids = sorted(cands)
+    parent = {p: p for p in pids}
 
-def _amount(record):
-    for name in ("amount", "gross", "value", "minor_units"):
-        if record.get(name) is None:
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    owner = {}
+    for p in pids:
+        for inv_id in cands[p]:
+            if inv_id in owner:
+                a, b = find(p), find(owner[inv_id])
+                if a != b:
+                    parent[max(a, b)] = min(a, b)
+            else:
+                owner[inv_id] = p
+    comps = {}
+    for p in pids:
+        comps.setdefault(find(p), []).append(p)
+    return [sorted(v) for _, v in sorted(comps.items())]
+
+
+def marginals(cands, scores, null_scores=None):
+    """Exact marginals of the one-to-one assignment distribution.
+
+    P(assignment) ~ prod exp(score of assigned link) * prod exp(NULL) for
+    unmatched payments.  Enumerated per connected component, with a budgeted
+    fallback (greedy-conditioned) for pathologically large components.
+    """
+    null_scores = null_scores or {}
+    result = {p: {} for p in cands}
+    for comp in components(cands):
+        # smallest-branching first keeps the enumeration tight
+        order = sorted(comp, key=lambda p: len(cands[p]))
+        budget = [200000]
+        total = [0.0]
+        acc = {p: {} for p in comp}
+        null_acc = {p: 0.0 for p in comp}
+
+        def rec(k, used, weight, chosen):
+            if budget[0] <= 0:
+                return
+            if k == len(order):
+                budget[0] -= 1
+                total[0] += weight
+                for p, i in chosen:
+                    if i is None:
+                        null_acc[p] += weight
+                    else:
+                        acc[p][i] = acc[p].get(i, 0.0) + weight
+                return
+            p = order[k]
+            rec(k + 1, used, weight * math.exp(null_scores.get(p, NULL_LOGIT) / TEMPERATURE), chosen + [(p, None)])
+            for inv_id in cands[p]:
+                if inv_id not in used:
+                    rec(k + 1, used | {inv_id}, weight * math.exp(scores[(p, inv_id)] / TEMPERATURE), chosen + [(p, inv_id)])
+
+        rec(0, frozenset(), 1.0, [])
+        if budget[0] <= 0 or total[0] <= 0:
+            # fallback: independent softmax per payment (never forces a match)
+            for p in comp:
+                z = math.exp(null_scores.get(p, NULL_LOGIT) / TEMPERATURE) + sum(math.exp(scores[(p, i)] / TEMPERATURE) for i in cands[p])
+                result[p] = {i: math.exp(scores[(p, i)] / TEMPERATURE) / z for i in cands[p]}
+        else:
+            for p in comp:
+                result[p] = {i: w / total[0] for i, w in acc[p].items()}
+    return result
+
+
+def choose_matches(cands, marg, value, threshold=None):
+    """Maximise expected score: value * (5p - 4) per accepted link, one-to-one."""
+    links = []
+    for p, row in marg.items():
+        for i, pr in row.items():
+            gain = value[p] * ((1 + WRONG_MULT) * pr - WRONG_MULT)
+            if gain > 0:
+                links.append((p, i, gain))
+    best = {}
+    by_pay = {}
+    for p, i, g in links:
+        by_pay.setdefault(p, []).append((i, g))
+    for comp in components({p: [i for i, _ in v] for p, v in by_pay.items()}):
+        opts = {p: by_pay[p] for p in comp}
+        order = sorted(comp)
+        top = [0.0, {}]
+
+        def rec(k, used, total, chosen):
+            if k == len(order):
+                if total > top[0] + 1e-12:
+                    top[0], top[1] = total, dict(chosen)
+                return
+            p = order[k]
+            rec(k + 1, used, total, chosen)
+            for i, g in sorted(opts[p]):
+                if i not in used:
+                    chosen[p] = i
+                    rec(k + 1, used | {i}, total + g, chosen)
+                    del chosen[p]
+
+        rec(0, frozenset(), 0.0, {})
+        best.update(top[1])
+    return best
+
+
+# ------------------------------------------------------------------- build --
+def build_model(obs):
+    groups = payment_groups(obs)
+    invoices = {i["invoice_id"]: i for i in obs["invoices"]}
+    pays = {p["payment_id"]: p for p in obs["payments"]}
+    docs = {}
+    for d in obs.get("remittance_documents", []):
+        docs.setdefault(d["payment_id"], []).append(d)
+    verified = {}
+    for inv in obs.get("investigations", []):
+        verified[inv["payment_id"]] = inv.get("verified_invoice_id")
+    return groups, invoices, pays, docs, verified
+
+
+def infer(obs, extra_verified=None):
+    groups, invoices, pays, docs, verified = build_model(obs)
+    if extra_verified:
+        for k, v in extra_verified.items():
+            verified.setdefault(k, v)
+    taken = {v for v in verified.values() if v is not None}
+    cands, scores, null_scores = {}, {}, {}
+    value = {p: groups[p]["captured"] for p in pays}
+    for pid, pay in pays.items():
+        if pid in verified:
             continue
-        try:
-            return abs(int(record[name]))
-        except (TypeError, ValueError):
+        grp = groups[pid]
+        row, tax_hit = [], False
+        for iid, inv in invoices.items():
+            if not eligible(pay, grp, inv):
+                continue
+            if norm_tax(pay.get("tax_suffix")) == norm_tax(inv["tax_suffix"]):
+                tax_hit = True
+            if iid in taken:
+                continue
+            row.append(iid)
+            scores[(pid, iid)] = score(pay, grp, inv, docs.get(pid, []))
+        if row:
+            top = max(scores[(pid, i)] for i in row)
+            row = [i for i in row if scores[(pid, i)] >= top - PRUNE_MARGIN]
+            cands[pid] = sorted(row)
+            null_scores[pid] = NULL_LOGIT + (W_NULL_TAX_MATCHED if tax_hit else W_NULL_TAX_UNMATCHED)
+    marg = marginals(cands, scores, null_scores) if cands else {}
+    return dict(groups=groups, invoices=invoices, pays=pays, docs=docs, verified=verified,
+                cands=cands, scores=scores, null_scores=null_scores, marg=marg, value=value)
+
+
+def final_mapping(model):
+    mapping = {}
+    for pid, iid in model["verified"].items():
+        if iid is None:
             continue
-    return 0
-    
-def _integrations(observation):
-    matcher = None
+        pay, inv = model["pays"].get(pid), model["invoices"].get(iid)
+        if pay is None or inv is None or not eligible(pay, model["groups"][pid], inv):
+            continue  # verified but impossible under accounting rules: keep integrity
+        if iid in mapping.values():
+            continue
+        mapping[pid] = iid
+    picks = choose_matches(model["cands"], model["marg"], model["value"])
+    for pid, iid in picks.items():
+        if iid not in mapping.values():
+            mapping[pid] = iid
+    return mapping
+
+
+def pick_query(model, queried, remaining):
+    if remaining <= 0:
+        return None
+    mapping = final_mapping(model)
+    best, best_gain = None, 0.0
+    for pid in sorted(model["cands"]):
+        if pid in queried or pid in model["verified"]:
+            continue
+        v = model["value"][pid]
+        row = model["marg"].get(pid, {})
+        p_real = sum(row.values())
+        p_pick = row.get(mapping.get(pid), 0.0) if pid in mapping else 0.0
+        now = v * ((1 + WRONG_MULT) * p_pick - WRONG_MULT) if pid in mapping else 0.0
+        gain = v * p_real - QUERY_COST - now
+        if gain > best_gain:
+            best, best_gain = pid, gain
+    return best
+
+
+def ledger_and_suspense(obs, mapping):
+    fields = ("captured", "refunded", "fees", "net")
+    rows = {i["invoice_id"]: dict.fromkeys(fields, 0) for i in obs["invoices"]}
+    suspense = dict.fromkeys(fields, 0)
+    for t in unique_transactions(obs):
+        row = rows[mapping[t["payment_id"]]] if t["payment_id"] in mapping else suspense
+        gross = _int(t["gross"])
+        row["captured"] += max(gross, 0)
+        row["refunded"] += max(-gross, 0)
+        row["fees"] += _int(t["fee"])
+        row["net"] += _int(t["net"])
+    ledger = []
+    for i in obs["invoices"]:
+        r = rows[i["invoice_id"]]
+        ledger.append(dict(invoice_id=i["invoice_id"], captured=r["captured"], refunded=r["refunded"],
+                           fees=r["fees"], net=r["net"],
+                           remaining_due=_int(i["amount"]) - r["captured"] + r["refunded"]))
+    return ledger, suspense
+
+
+def submission(obs, mapping):
+    ledger, suspense = ledger_and_suspense(obs, mapping)
+    return dict(op="submit",
+                matches=[dict(payment_id=p, invoice_id=i) for p, i in sorted(mapping.items())],
+                ledger=ledger, suspense=suspense,
+                bank_total=sum(_int(b["amount"]) for b in unique_bank_credits(obs)))
+
+
+def safe_submission(obs):
+    """Last-resort valid submission: nothing matched, everything in suspense."""
+    return submission(obs, {})
+
+
+def decide(observation, state):
+    state = dict(state) if isinstance(state, dict) else {}
+    queried = list(state.get("queried", []))
     try:
-        from matcher import match_payment as matcher  # type: ignore
-    except ImportError:
-        pass
-    return (
-        _records(observation, "payments") or _records(observation, "transactions"),
-        _records(observation, "invoices"),
-        matcher,
-    )
+        for inv in observation.get("investigations", []):
+            if inv["payment_id"] not in queried:
+                queried.append(inv["payment_id"])
+        remaining = observation.get("queries_remaining", 0)
+        model = infer(observation)
+        used = len(observation.get("investigations", []))
+        remaining = min(remaining, MAX_QUERIES - used)
+        pid = pick_query(model, set(queried), remaining)
+        if pid is not None:
+            queried.append(pid)
+            return {"action": {"op": "query", "payment_id": pid},
+                    "state": {"queried": queried, "v": 1}}
+        mapping = final_mapping(model)
+        return {"action": submission(observation, mapping), "state": {"queried": queried, "v": 1}}
+    except Exception as exc:  # fail safe, but with a valid submission shape
+        return {"action": safe_submission(observation),
+                "state": {"queried": queried, "v": 1, "error": repr(exc)[:200]}}
